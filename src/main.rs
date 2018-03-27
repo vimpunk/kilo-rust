@@ -9,7 +9,7 @@ use nix::sys::termios;
 
 /// A data type that represents where in the console window something resides.
 /// Indexing starts at 1 (since this is what the VT100 escape sequences expect
-/// as well) which corresponds to the top left corner of the terminal. 
+/// as well) which corresponds to the top left corner of the terminal.
 #[derive(Debug, Clone, Copy)]
 struct Pos {
     col: i32,
@@ -55,7 +55,11 @@ impl Editor {
         let mut raw_termios = orig_termios.clone();
 
         termios::cfmakeraw(&mut raw_termios);
-        termios::tcsetattr(io::stdin().as_raw_fd(), termios::SetArg::TCSANOW, &raw_termios).unwrap();
+        termios::tcsetattr(
+            io::stdin().as_raw_fd(),
+            termios::SetArg::TCSANOW,
+            &raw_termios,
+        ).unwrap();
 
         Editor {
             orig_termios,
@@ -89,18 +93,20 @@ impl Editor {
                 if let Some(key) = self.read_esc_seq_to_key() {
                     match key {
                         Key::ArrowUp if self.cursor.row > 1 => self.cursor.row -= 1,
-                        Key::ArrowDown if self.cursor.row < self.bottom_right_corner.row
-                            => self.cursor.row += 1,
+                        Key::ArrowDown if self.cursor.row < self.bottom_right_corner.row => {
+                            self.cursor.row += 1
+                        }
                         Key::ArrowLeft if self.cursor.col > 1 => self.cursor.col -= 1,
-                        Key::ArrowRight if self.cursor.col < self.bottom_right_corner.col
-                            => self.cursor.col += 1,
+                        Key::ArrowRight if self.cursor.col < self.bottom_right_corner.col => {
+                            self.cursor.col += 1
+                        }
                         // TODO for now these are equivalent but that'll change
                         Key::PageUp | Key::Home => self.cursor.row = 1,
                         Key::PageDown | Key::End => self.cursor.row = self.bottom_right_corner.row,
-                        _ => ()
+                        _ => (),
                     }
                 }
-            },
+            }
             _ => {
                 println!("unhandled input: {}/{}", c as u8, c);
             }
@@ -126,8 +132,8 @@ impl Editor {
                             '3' => Some(Key::Delete),
                             '5' => Some(Key::PageUp),
                             '6' => Some(Key::PageDown),
-                            _ => None
-                        }
+                            _ => None,
+                        };
                     }
                 } else {
                     return match buf[1] as char {
@@ -137,28 +143,28 @@ impl Editor {
                         'D' => Some(Key::ArrowLeft),
                         'H' => Some(Key::Home),
                         'F' => Some(Key::End),
-                        _ => None
-                    }
+                        _ => None,
+                    };
                 }
             } else if buf[0] as char == 'O' {
                 return match buf[1] as char {
                     'H' => Some(Key::Home),
                     'F' => Some(Key::End),
-                    _ => None
-                }
+                    _ => None,
+                };
             }
         }
         None
     }
 
-    fn refresh_screen(&mut self,) {
+    fn refresh_screen(&mut self) {
         // Query window size as it may have been changed since the last redraw.
         // TODO if possible, listen to window resize events.
         self.update_window_size();
         // Hide cursor while redrawing to avoid glitching.
         self.hide_cursor();
         self.move_cursor(Pos { row: 1, col: 1 }); // Is this needed?
-        // Append text to write buffer while clearing old data.
+                                                  // Append text to write buffer while clearing old data.
         self.prepare_rows();
         // (Rust giving me crap for directly passing self.cursor.)
         let cursor = self.cursor;
@@ -174,7 +180,7 @@ impl Editor {
         for _ in 1..(rows - 1) {
             self.write_buf += "~\r\n";
             self.clear_line();
-        } 
+        }
         // Don't put a new line on our last row as that will make the terminal
         // window scroll down.
         self.write_buf += "~";
@@ -186,6 +192,10 @@ impl Editor {
         io::stdout().flush().unwrap();
         // Does not alter its capacity.
         self.write_buf.clear();
+    }
+
+    fn move_cursor(&mut self, pos: Pos) {
+        self.defer_esc_seq(&format!("{};{}H", pos.row, pos.col));
     }
 
     fn hide_cursor(&mut self) {
@@ -225,10 +235,6 @@ impl Editor {
         self.bottom_right_corner = self.cursor_pos();
     }
 
-    fn move_cursor(&mut self, pos: Pos) {
-        self.defer_esc_seq(&format!("{};{}H", pos.row, pos.col));
-    }
-
     fn cursor_pos(&mut self) -> Pos {
         // Query cursor position.
         self.send_esc_seq("6n");
@@ -242,12 +248,12 @@ impl Editor {
             match r {
                 Ok(c) => {
                     if c == 'R' as u8 {
-                        break; 
+                        break;
                     } else {
                         response.push(c as char);
                     }
-                },
-                Err(_) => ()
+                }
+                Err(_) => (),
             }
         }
 
@@ -274,7 +280,11 @@ impl Editor {
 
 impl Drop for Editor {
     fn drop(&mut self) {
-        termios::tcsetattr(io::stdin().as_raw_fd(), termios::SetArg::TCSANOW, &self.orig_termios).unwrap();
+        termios::tcsetattr(
+            io::stdin().as_raw_fd(),
+            termios::SetArg::TCSANOW,
+            &self.orig_termios,
+        ).unwrap();
         // Restore user's screen on exit.
         self.clear_screen();
     }
