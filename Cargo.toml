@@ -1,0 +1,6 @@
+[package]
+name = "kilo-rust"
+version = "0.1.0"
+authors = ["mandreyel <mandreyel@protonmail.com>"]
+
+[dependencies]
