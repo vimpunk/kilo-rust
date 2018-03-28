@@ -1,7 +1,7 @@
 # kilo-rust
 
 ## What
-This is a small, work-in-progress educational project whereby I (try to) implement a basic text editor by porting [antirez's kilo editor](https://github.com/antirez/kilo) to Rust.
+This is a small educational project whereby I (try to) implement a basic text editor by porting [antirez's kilo editor](https://github.com/antirez/kilo) to Rust.
 
 ## Why
 I thought this might be a sufficiently interesting yet not too overwhelming first project while reading the amazing [Rust book](https://doc.rust-lang.org/stable/book/second-edition/) and learning Rust.

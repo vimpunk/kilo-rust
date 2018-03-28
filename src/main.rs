@@ -33,9 +33,6 @@ fn ctrl_mask(c: u8) -> u8 {
 }
 
 struct Editor {
-    // Save the terminal config as it was before entering raw mode with the
-    // instantiation of the editor so that we can restore it on drop.
-    orig_termios: termios::Termios,
     // Note that this does not always report the actual position of the cursor.
     // Instead, it is the _desired_ position, i.e. what user sets. It may be
     // that for rendering purposes the cursor is temporarily relocated, but then
@@ -51,18 +48,7 @@ struct Editor {
 
 impl Editor {
     pub fn new() -> Editor {
-        let orig_termios = termios::tcgetattr(io::stdin().as_raw_fd()).unwrap();
-        let mut raw_termios = orig_termios.clone();
-
-        termios::cfmakeraw(&mut raw_termios);
-        termios::tcsetattr(
-            io::stdin().as_raw_fd(),
-            termios::SetArg::TCSANOW,
-            &raw_termios,
-        ).unwrap();
-
         Editor {
-            orig_termios,
             cursor: Pos { row: 1, col: 1 },
             bottom_right_corner: Pos { row: 1, col: 1 },
             write_buf: String::new(),
@@ -280,16 +266,30 @@ impl Editor {
 
 impl Drop for Editor {
     fn drop(&mut self) {
-        termios::tcsetattr(
-            io::stdin().as_raw_fd(),
-            termios::SetArg::TCSANOW,
-            &self.orig_termios,
-        ).unwrap();
-        // Restore user's screen on exit.
+        // Restore user's screen.
         self.clear_screen();
     }
 }
 
 fn main() {
+    // Save the terminal config as it was before entering raw mode with the
+    // instantiation of the editor so that we can restore it on drop.
+    let orig_termios = termios::tcgetattr(io::stdin().as_raw_fd()).unwrap();
+    let mut raw_termios = orig_termios.clone();
+
+    termios::cfmakeraw(&mut raw_termios);
+    termios::tcsetattr(
+        io::stdin().as_raw_fd(),
+        termios::SetArg::TCSANOW,
+        &raw_termios,
+    ).unwrap();
+
     Editor::new().run();
+
+    // Restore the original termios config.
+    termios::tcsetattr(
+        io::stdin().as_raw_fd(),
+        termios::SetArg::TCSANOW,
+        &orig_termios,
+    ).unwrap();
 }
