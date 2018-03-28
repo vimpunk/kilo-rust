@@ -1,9 +1,14 @@
 extern crate nix;
 
 use std::io;
-use std::io::Write;
 use std::io::prelude::*;
+use std::io::Write;
+use std::io::BufReader;
+use std::fs::File;
 use std::os::unix::io::AsRawFd;
+use std::env::args;
+use std::path::Path;
+use std::cmp::min;
 
 use nix::sys::termios;
 
@@ -39,11 +44,16 @@ struct Editor {
     // always set back to this position. This also means that when it's
     // temporarily relocated, this field shall not be updated.
     cursor: Pos,
-    // The position of the bottom right corner of the window.
+    // The position of the bottom right corner of the window. This is used as
+    // window size.
     bottom_right_corner: Pos,
     // Used to coalesce writes into a single buffer to then flush it in one go
     // to avoid excessive IO overhead.
-    write_buf: String,
+    write_buf: Vec<u8>,
+    // Store each row as a separate string in a vector.
+    rows: Vec<String>,
+    // The zero based index into `rows` of the first row to show.
+    curr_row: i32,
 }
 
 impl Editor {
@@ -51,12 +61,35 @@ impl Editor {
         Editor {
             cursor: Pos { row: 1, col: 1 },
             bottom_right_corner: Pos { row: 1, col: 1 },
-            write_buf: String::new(),
+            write_buf: vec![],
+            rows: vec![],
+            curr_row: 0,
         }
     }
 
+    pub fn open_file(path: &Path) -> Editor {
+        let mut editor = Editor::new();
+
+        if let Ok(file) = File::open(path) {
+            let reader = BufReader::new(file);
+            let lines = reader.lines();
+            // Try to get an esimate of the number of lines in file.
+            let size_hint = {
+                let (lower, upper) = lines.size_hint();
+                if let Some(upper) = upper { upper } else { lower }
+            };
+
+            editor.rows.reserve(size_hint);
+            // TODO correct error handling and may need to truncate \n
+            editor.rows = lines
+                .map(|line| line.expect("could not parse line!"))
+                .collect();
+        }
+
+        editor
+    }
+
     pub fn run(&mut self) {
-        // Single byte buffer for incremental reading.
         let mut buf: [u8; 1] = [0; 1];
         loop {
             self.refresh_screen();
@@ -162,19 +195,56 @@ impl Editor {
     }
 
     fn prepare_rows(&mut self) {
-        let rows = self.bottom_right_corner.row;
-        for _ in 1..(rows - 1) {
-            self.write_buf += "~\r\n";
+        let n_rows = self.bottom_right_corner.row;
+        let n_cols = self.bottom_right_corner.col;
+
+        let mut n_rows_drawn = 0;
+        for (i, row) in self.rows.iter().enumerate() {
+            if i as i32 == n_rows {
+                break;
+            }
+
+            // Clear line.
+            self.write_buf.extend_from_slice("\x1b[K".as_bytes());
+
+            // The line might be longer than the width of our window, so it needs
+            // to be split accross rows and wrapped.
+            let mut n_bytes_left = row.len() as i32;
+            let mut offset = 0;
+            while n_bytes_left > 0 {
+                let end = offset + min(n_cols, n_bytes_left) as usize;
+                let row = &row.as_bytes()[offset..end];
+
+                offset += row.len();
+                n_bytes_left -= row.len() as i32;
+                n_rows_drawn += 1;
+
+                self.write_buf.extend_from_slice(row);
+                // Don't put a new line on the last row.
+                if n_rows_drawn < n_rows - 1 {
+                    self.write_buf.extend_from_slice("\r\n".as_bytes());
+                }
+            }
+        }
+
+        // There may not be enough text to fill all the rows of the window, so
+        // fill the rest with '~'s.
+        let n_rows_left = n_rows - n_rows_drawn;
+        if n_rows_left > 0 {
+            for _ in 1..(n_rows_left - 1) {
+                self.write_buf.extend_from_slice("~\r\n".as_bytes());
+                self.clear_line();
+            }
+
+            // Don't put a new line on our last row as that will make the terminal
+            // scroll down.
+            self.write_buf.extend_from_slice("~".as_bytes());
             self.clear_line();
         }
-        // Don't put a new line on our last row as that will make the terminal
-        // window scroll down.
-        self.write_buf += "~";
-        self.clear_line();
     }
 
     fn flush_write_buf(&mut self) {
-        io::stdout().write(&self.write_buf.as_bytes()).unwrap();
+        io::stdout().write(&self.write_buf).unwrap();
         io::stdout().flush().unwrap();
         // Does not alter its capacity.
         self.write_buf.clear();
@@ -203,7 +273,7 @@ impl Editor {
     /// Appends the specified escape sequence to the write buffer which needs to
     /// be manually flushed for the sequence to take effect.
     fn defer_esc_seq(&mut self, cmd: &str) {
-        self.write_buf += &format!("\x1b[{}", cmd);
+        self.write_buf.extend_from_slice(&format!("\x1b[{}", cmd).as_bytes());
     }
 
     /// Immeadiately sends the specified escape sequence to the terminal.
@@ -284,7 +354,12 @@ fn main() {
         &raw_termios,
     ).unwrap();
 
-    Editor::new().run();
+    let args: Vec<String> = args().collect();
+    if args.len() > 1 {
+        Editor::open_file(Path::new(&args[1])).run();
+    } else {
+        Editor::new().run();
+    }
 
     // Restore the original termios config.
     termios::tcsetattr(
