@@ -3,13 +3,12 @@ extern crate nix;
 use std::io;
 use std::io::prelude::*;
 use std::io::Write;
-use std::io::BufReader;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::env::args;
 use std::path::Path;
-use std::cmp::min;
+use std::cmp::{min, max};
 
 use nix::sys::termios;
 
@@ -54,7 +53,7 @@ struct Editor {
     // Store each row as a separate string in a vector.
     rows: Vec<Vec<u8>>,
     // The zero based index into `rows` of the first row to show.
-    curr_row: i32,
+    row_offset: i32,
 }
 
 fn init_log() {
@@ -85,7 +84,7 @@ impl Editor {
             bottom_right_corner: Pos { row: 1, col: 1 },
             write_buf: vec![],
             rows: vec![],
-            curr_row: 0,
+            row_offset: 0,
         }
     }
 
@@ -137,26 +136,64 @@ impl Editor {
 
     fn handle_key(&mut self, c: char) {
         match c {
-            '\x1b' => {
-                if let Some(key) = self.read_esc_seq_to_key() {
-                    match key {
-                        Key::ArrowUp if self.cursor.row > 1 => self.cursor.row -= 1,
-                        Key::ArrowDown if self.cursor.row < self.bottom_right_corner.row => {
-                            self.cursor.row += 1
+            '\x1b' => self.handle_esc_seq_key(),
+            _ => self.handle_input()
+        }
+    }
+
+    fn handle_esc_seq_key(&mut self) {
+        if let Some(key) = self.read_esc_seq_to_key() {
+            let n_rows = self.rows.len() as i32;
+            match key {
+                Key::ArrowUp => {
+                    // If cursor is at the top of the window, we need to
+                    // scroll.  This is handled by decrementing the
+                    // row_offset if it's not already 0.
+                    if self.cursor.row == 1 {
+                        if self.row_offset > 0 {
+                            self.row_offset -= 1;
                         }
-                        Key::ArrowLeft if self.cursor.col > 1 => self.cursor.col -= 1,
-                        Key::ArrowRight if self.cursor.col < self.bottom_right_corner.col => {
-                            self.cursor.col += 1
-                        }
-                        // TODO for now these are equivalent but that'll change
-                        Key::PageUp | Key::Home => self.cursor.row = 1,
-                        Key::PageDown | Key::End => self.cursor.row = self.bottom_right_corner.row,
-                        _ => (),
+                    } else {
+                        self.cursor.row -= 1;
                     }
+                },
+                Key::ArrowDown => {
+                    // If cursor is at the bottom of the window, we need
+                    // to scroll. This is handled by incrementing the
+                    // row_offset if it's not already pointing to the
+                    // last row.
+                    if self.cursor.row == self.window_height() {
+                        if self.row_offset < n_rows {
+                            self.row_offset += 1;
+                        }
+                    } else {
+                        self.cursor.row += 1;
+                    }
+                },
+                Key::ArrowLeft if self.cursor.col > 1 => self.cursor.col -= 1,
+                Key::ArrowRight if self.cursor.col < self.window_width() => {
+                    self.cursor.col += 1
                 }
-            }
-            _ => {
-                println!("unhandled input: {}/{}", c as u8, c);
+                Key::PageUp => {
+                    self.row_offset = max(0, self.row_offset - self.window_height());
+                },
+                Key::PageDown => {
+                    // Don't offset past the total number of rows minus the window
+                    // height (we want to fill the whole window).
+                    let max_row_offset = max(0, n_rows - self.window_height());
+                    let new_row_offset = self.row_offset + self.window_height();
+                    self.row_offset = min(max_row_offset, new_row_offset);
+                },
+                Key::Home => {
+                    self.cursor = Pos { row: 1, col: 1 };
+                    self.row_offset = 0;
+                }
+                Key::End => {
+                    self.cursor = Pos {  col: 1, row: self.window_height() };
+                    // FIXME for some reason there are 2 extra empty rows
+                    self.row_offset = n_rows - self.window_height();
+                }
+                _ => (),
             }
         }
     }
@@ -205,6 +242,9 @@ impl Editor {
         None
     }
 
+    fn handle_input(&mut self) {
+    }
+
     fn refresh_screen(&mut self) {
         // Query window size as it may have been changed since the last redraw.
         // TODO if possible, listen to window resize events.
@@ -224,12 +264,9 @@ impl Editor {
     }
 
     fn prepare_rows(&mut self) {
-        let n_rows = self.bottom_right_corner.row;
-        let n_cols = self.bottom_right_corner.col;
-
         let mut n_rows_drawn = 0;
-        for row in self.rows.iter() {
-            if n_rows_drawn == n_rows {
+        for row in self.rows.iter().skip(self.row_offset as usize) {
+            if n_rows_drawn == self.window_height() {
                 break;
             }
 
@@ -248,7 +285,7 @@ impl Editor {
             } else {
                 let mut offset = 0;
                 while n_bytes_left > 0 {
-                    let end = offset + min(n_cols, n_bytes_left) as usize;
+                    let end = offset + min(self.window_width(), n_bytes_left) as usize;
                     let row = &row[offset..end];
 
                     offset += row.len();
@@ -257,7 +294,7 @@ impl Editor {
 
                     self.write_buf.extend_from_slice(row);
                     // Don't put a new line on the last row.
-                    if n_rows_drawn < n_rows {
+                    if n_rows_drawn < self.window_height() {
                         self.write_buf.extend_from_slice("\r\n".as_bytes());
                     }
                 }
@@ -266,10 +303,10 @@ impl Editor {
 
         // There may not be enough text to fill all the rows of the window, so
         // fill the rest with '~'s.
-        let n_rows_left = n_rows - n_rows_drawn;
+        let n_rows_left = self.window_height() - n_rows_drawn;
         log(format!(
             "rows: {} total, {} drawn, {} left",
-            n_rows, n_rows_drawn, n_rows_left
+            self.window_height(), n_rows_drawn, n_rows_left
         ).as_bytes());
         if n_rows_left > 0 {
             for _ in 1..(n_rows_left - 1) {
@@ -320,6 +357,14 @@ impl Editor {
     /// Immeadiately sends the specified escape sequence to the terminal.
     fn send_esc_seq(&mut self, cmd: &str) {
         println!("\x1b[{}", cmd);
+    }
+
+    fn window_width(&self) -> i32 {
+        self.bottom_right_corner.col
+    }
+
+    fn window_height(&self) -> i32 {
+        self.bottom_right_corner.row
     }
 
     fn update_window_size(&mut self) {
