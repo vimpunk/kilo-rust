@@ -5,6 +5,7 @@ use std::io::prelude::*;
 use std::io::Write;
 use std::io::BufReader;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::env::args;
 use std::path::Path;
@@ -51,9 +52,30 @@ struct Editor {
     // to avoid excessive IO overhead.
     write_buf: Vec<u8>,
     // Store each row as a separate string in a vector.
-    rows: Vec<String>,
+    rows: Vec<Vec<u8>>,
     // The zero based index into `rows` of the first row to show.
     curr_row: i32,
+}
+
+fn init_log() {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("/tmp/kilo-rust.log")
+        .unwrap();
+}
+
+fn log(buf: &[u8]) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open("/tmp/kilo-rust.log")
+        .unwrap();
+    file.write("NEW LOG ENTRY\n".as_bytes()).unwrap();
+    file.write(&buf).unwrap();
+    file.write("\n".as_bytes()).unwrap();
+    file.flush().unwrap();
 }
 
 impl Editor {
@@ -70,19 +92,26 @@ impl Editor {
     pub fn open_file(path: &Path) -> Editor {
         let mut editor = Editor::new();
 
-        if let Ok(file) = File::open(path) {
-            let reader = BufReader::new(file);
-            let lines = reader.lines();
+        // TODO error handling: somehow let user know that we could not open file
+        if let Ok(mut file) = File::open(path) {
+            let mut buf = vec![];
+            file.read_to_end(&mut buf).unwrap();
+            log(&buf);
+
+            // TODO might need to match \r\n as well
+            let lines = buf.split(|b| *b == '\n' as u8);
             // Try to get an esimate of the number of lines in file.
             let size_hint = {
                 let (lower, upper) = lines.size_hint();
                 if let Some(upper) = upper { upper } else { lower }
             };
 
-            editor.rows.reserve(size_hint);
-            // TODO correct error handling and may need to truncate \n
+            if size_hint > 0 {
+                editor.rows.reserve(size_hint);
+            }
+
             editor.rows = lines
-                .map(|line| line.expect("could not parse line!"))
+                .map(|bytes| bytes.to_vec())
                 .collect();
         }
 
@@ -199,8 +228,8 @@ impl Editor {
         let n_cols = self.bottom_right_corner.col;
 
         let mut n_rows_drawn = 0;
-        for (i, row) in self.rows.iter().enumerate() {
-            if i as i32 == n_rows {
+        for row in self.rows.iter() {
+            if n_rows_drawn == n_rows {
                 break;
             }
 
@@ -208,21 +237,29 @@ impl Editor {
             self.write_buf.extend_from_slice("\x1b[K".as_bytes());
 
             // The line might be longer than the width of our window, so it needs
-            // to be split accross rows and wrapped.
+            // to be split accross rows and wrapped. Count how many bytes are left in
+            // the row to draw.
             let mut n_bytes_left = row.len() as i32;
-            let mut offset = 0;
-            while n_bytes_left > 0 {
-                let end = offset + min(n_cols, n_bytes_left) as usize;
-                let row = &row.as_bytes()[offset..end];
 
-                offset += row.len();
-                n_bytes_left -= row.len() as i32;
+            // A row is empty if it's just a line break.
+            if n_bytes_left == 0 {
+                self.write_buf.extend_from_slice("\r\n".as_bytes());
                 n_rows_drawn += 1;
+            } else {
+                let mut offset = 0;
+                while n_bytes_left > 0 {
+                    let end = offset + min(n_cols, n_bytes_left) as usize;
+                    let row = &row[offset..end];
 
-                self.write_buf.extend_from_slice(row);
-                // Don't put a new line on the last row.
-                if n_rows_drawn < n_rows - 1 {
-                    self.write_buf.extend_from_slice("\r\n".as_bytes());
+                    offset += row.len();
+                    n_bytes_left -= row.len() as i32;
+                    n_rows_drawn += 1;
+
+                    self.write_buf.extend_from_slice(row);
+                    // Don't put a new line on the last row.
+                    if n_rows_drawn < n_rows {
+                        self.write_buf.extend_from_slice("\r\n".as_bytes());
+                    }
                 }
             }
         }
@@ -230,6 +267,10 @@ impl Editor {
         // There may not be enough text to fill all the rows of the window, so
         // fill the rest with '~'s.
         let n_rows_left = n_rows - n_rows_drawn;
+        log(format!(
+            "rows: {} total, {} drawn, {} left",
+            n_rows, n_rows_drawn, n_rows_left
+        ).as_bytes());
         if n_rows_left > 0 {
             for _ in 1..(n_rows_left - 1) {
                 self.write_buf.extend_from_slice("~\r\n".as_bytes());
@@ -342,6 +383,7 @@ impl Drop for Editor {
 }
 
 fn main() {
+    init_log();
     // Save the terminal config as it was before entering raw mode with the
     // instantiation of the editor so that we can restore it on drop.
     let orig_termios = termios::tcgetattr(io::stdin().as_raw_fd()).unwrap();
