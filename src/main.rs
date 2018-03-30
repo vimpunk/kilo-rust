@@ -50,10 +50,13 @@ struct Editor {
     // Used to coalesce writes into a single buffer to then flush it in one go
     // to avoid excessive IO overhead.
     write_buf: Vec<u8>,
-    // Store each row as a separate string in a vector.
-    rows: Vec<Vec<u8>>,
-    // The zero based index into `rows` of the first row to show.
-    row_offset: i32,
+    // Store each line as a separate string in a vector. Note that there is
+    // a distinction between rows and lines. A line is the string of text until
+    // the new-line character, as stored on disk, while a row is the rendered
+    // string. This means a line may wrap several rows.
+    lines: Vec<Vec<u8>>,
+    // The zero based index into `lines` of the first line to show.
+    line_offset: i32,
 }
 
 fn init_log() {
@@ -83,8 +86,8 @@ impl Editor {
             cursor: Pos { row: 1, col: 1 },
             bottom_right_corner: Pos { row: 1, col: 1 },
             write_buf: vec![],
-            rows: vec![],
-            row_offset: 0,
+            lines: vec![],
+            line_offset: 0,
         }
     }
 
@@ -106,11 +109,11 @@ impl Editor {
             };
 
             if size_hint > 0 {
-                editor.rows.reserve(size_hint);
+                editor.lines.reserve(size_hint);
             }
 
-            editor.rows = lines
-                .map(|bytes| bytes.to_vec())
+            editor.lines = lines
+                .map(|line| line.to_vec())
                 .collect();
         }
 
@@ -143,15 +146,15 @@ impl Editor {
 
     fn handle_esc_seq_key(&mut self) {
         if let Some(key) = self.read_esc_seq_to_key() {
-            let n_rows = self.rows.len() as i32;
+            let n_lines = self.lines.len() as i32;
             match key {
                 Key::ArrowUp => {
                     // If cursor is at the top of the window, we need to
                     // scroll.  This is handled by decrementing the
-                    // row_offset if it's not already 0.
+                    // line_offset if it's not already 0.
                     if self.cursor.row == 1 {
-                        if self.row_offset > 0 {
-                            self.row_offset -= 1;
+                        if self.line_offset > 0 {
+                            self.line_offset -= 1;
                         }
                     } else {
                         self.cursor.row -= 1;
@@ -160,11 +163,11 @@ impl Editor {
                 Key::ArrowDown => {
                     // If cursor is at the bottom of the window, we need
                     // to scroll. This is handled by incrementing the
-                    // row_offset if it's not already pointing to the
+                    // line_offset if it's not already pointing to the
                     // last row.
                     if self.cursor.row == self.window_height() {
-                        if self.row_offset < n_rows {
-                            self.row_offset += 1;
+                        if self.line_offset < n_lines {
+                            self.line_offset += 1;
                         }
                     } else {
                         self.cursor.row += 1;
@@ -175,23 +178,23 @@ impl Editor {
                     self.cursor.col += 1
                 }
                 Key::PageUp => {
-                    self.row_offset = max(0, self.row_offset - self.window_height());
+                    self.line_offset = max(0, self.line_offset - self.window_height());
                 },
                 Key::PageDown => {
                     // Don't offset past the total number of rows minus the window
                     // height (we want to fill the whole window).
-                    let max_row_offset = max(0, n_rows - self.window_height());
-                    let new_row_offset = self.row_offset + self.window_height();
-                    self.row_offset = min(max_row_offset, new_row_offset);
+                    let max_line_offset = max(0, n_lines - self.window_height());
+                    let new_line_offset = self.line_offset + self.window_height();
+                    self.line_offset = min(max_line_offset, new_line_offset);
                 },
                 Key::Home => {
                     self.cursor = Pos { row: 1, col: 1 };
-                    self.row_offset = 0;
+                    self.line_offset = 0;
                 }
                 Key::End => {
                     self.cursor = Pos {  col: 1, row: self.window_height() };
                     // FIXME for some reason there are 2 extra empty rows
-                    self.row_offset = n_rows - self.window_height();
+                    self.line_offset = n_lines - self.window_height();
                 }
                 _ => (),
             }
@@ -253,7 +256,7 @@ impl Editor {
         self.hide_cursor();
         self.move_cursor(Pos { row: 1, col: 1 }); // Is this needed?
                                                   // Append text to write buffer while clearing old data.
-        self.prepare_rows();
+        self.build_rows();
         // (Rust giving me crap for directly passing self.cursor.)
         let cursor = self.cursor;
         // Move cursor back to its original position.
@@ -263,22 +266,22 @@ impl Editor {
         self.flush_write_buf();
     }
 
-    fn prepare_rows(&mut self) {
+    fn build_rows(&mut self) {
         let mut n_rows_drawn = 0;
-        for row in self.rows.iter().skip(self.row_offset as usize) {
+        for line in self.lines.iter().skip(self.line_offset as usize) {
             if n_rows_drawn == self.window_height() {
                 break;
             }
 
-            // Clear line.
+            // Clear row.
             self.write_buf.extend_from_slice("\x1b[K".as_bytes());
 
             // The line might be longer than the width of our window, so it needs
             // to be split accross rows and wrapped. Count how many bytes are left in
             // the row to draw.
-            let mut n_bytes_left = row.len() as i32;
+            let mut n_bytes_left = line.len() as i32;
 
-            // A row is empty if it's just a line break.
+            // An empty line is just a line break.
             if n_bytes_left == 0 {
                 self.write_buf.extend_from_slice("\r\n".as_bytes());
                 n_rows_drawn += 1;
@@ -286,17 +289,17 @@ impl Editor {
                 let mut offset = 0;
                 while n_bytes_left > 0 {
                     let end = offset + min(self.window_width(), n_bytes_left) as usize;
-                    let row = &row[offset..end];
+                    let row = &line[offset..end];
 
                     offset += row.len();
                     n_bytes_left -= row.len() as i32;
-                    n_rows_drawn += 1;
 
                     self.write_buf.extend_from_slice(row);
                     // Don't put a new line on the last row.
                     if n_rows_drawn < self.window_height() {
                         self.write_buf.extend_from_slice("\r\n".as_bytes());
                     }
+                    n_rows_drawn += 1;
                 }
             }
         }
