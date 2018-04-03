@@ -52,8 +52,8 @@ struct Editor {
     write_buf: Vec<u8>,
     // Store each line as a separate string in a vector. Note that there is
     // a distinction between rows and lines. A line is the string of text until
-    // the new-line character, as stored on disk, while a row is the rendered
-    // string. This means a line may wrap several rows.
+    // the new-line character, as stored in the file, while a row is the
+    // rendered string. This means a line may wrap several rows.
     lines: Vec<Vec<u8>>,
     // The zero based index into `lines` of the first line to show.
     line_offset: i32,
@@ -148,44 +148,19 @@ impl Editor {
         if let Some(key) = self.read_esc_seq_to_key() {
             let n_lines = self.lines.len() as i32;
             match key {
-                Key::ArrowUp => {
-                    // If cursor is at the top of the window, we need to
-                    // scroll.  This is handled by decrementing the
-                    // line_offset if it's not already 0.
-                    if self.cursor.row == 1 {
-                        if self.line_offset > 0 {
-                            self.line_offset -= 1;
-                        }
-                    } else {
-                        self.cursor.row -= 1;
-                    }
-                },
-                Key::ArrowDown => {
-                    // If cursor is at the bottom of the window, we need
-                    // to scroll. This is handled by incrementing the
-                    // line_offset if it's not already pointing to the
-                    // last row.
-                    if self.cursor.row == self.window_height() {
-                        if self.line_offset < n_lines {
-                            self.line_offset += 1;
-                        }
-                    } else {
-                        self.cursor.row += 1;
-                    }
-                },
-                Key::ArrowLeft if self.cursor.col > 1 => self.cursor.col -= 1,
-                Key::ArrowRight if self.cursor.col < self.window_width() => {
-                    self.cursor.col += 1
-                }
+                Key::ArrowUp => self.cursor_down(),
+                Key::ArrowDown => self.cursor_up(),
+                Key::ArrowLeft => self.cursor_left(),
+                Key::ArrowRight => self.cursor_right(),
                 Key::PageUp => {
-                    self.line_offset = max(0, self.line_offset - self.window_height());
+                    for _ in 1..self.window_height() {
+                        self.cursor_up();
+                    }
                 },
                 Key::PageDown => {
-                    // Don't offset past the total number of rows minus the window
-                    // height (we want to fill the whole window).
-                    let max_line_offset = max(0, n_lines - self.window_height());
-                    let new_line_offset = self.line_offset + self.window_height();
-                    self.line_offset = min(max_line_offset, new_line_offset);
+                    for _ in 1..self.window_height() {
+                        self.cursor_down();
+                    }
                 },
                 Key::Home => {
                     self.cursor = Pos { row: 1, col: 1 };
@@ -199,6 +174,43 @@ impl Editor {
                 _ => (),
             }
         }
+    }
+
+    fn cursor_down(&mut self) {
+        // If cursor is at the top of the window, we need to
+        // scroll.  This is handled by decrementing the
+        // line_offset if it's not already 0.
+        if self.cursor.row == 1 {
+            if self.line_offset > 0 {
+                self.line_offset -= 1;
+            }
+        } else {
+            self.cursor.row -= 1;
+        }
+    }
+
+    fn cursor_up(&mut self) {
+        // If cursor is at the bottom of the window, we need
+        // to scroll. This is handled by incrementing the
+        // line_offset if it's not already pointing to the
+        // last row.
+        if self.cursor.row == self.window_height() {
+            if self.line_offset < n_lines {
+                self.line_offset += 1;
+            }
+        } else {
+            self.cursor.row += 1;
+        }
+    }
+
+    fn cursor_left(&mut self) {
+        //if self.cursor.col > 1 => self.cursor.col -= 1,
+    }
+
+    fn cursor_right(&mut self) {
+                //Key::ArrowRight if self.cursor.col < self.window_width() => {
+                    //self.cursor.col += 1
+                //}
     }
 
     /// This function is called after encountering a \x1b escape character from
