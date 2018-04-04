@@ -8,17 +8,19 @@ use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::env::args;
 use std::path::Path;
-use std::cmp::{min, max};
+use std::cmp;
 
 use nix::sys::termios;
 
 /// A data type that represents where in the console window something resides.
-/// Indexing starts at 1 (since this is what the VT100 escape sequences expect
-/// as well) which corresponds to the top left corner of the terminal.
+/// Indexing starts at 0 (even though the VT100 escape sequences expect
+/// coordinates starting at 1), because mixing 1-based indexing with 0-based
+/// indexing lead to errors. Pos { col: 0, row: 0 } corresponds to the top left
+/// corner of the terminal.
 #[derive(Debug, Clone, Copy)]
 struct Pos {
-    col: i32,
-    row: i32,
+    col: usize,
+    row: usize,
 }
 
 enum Key {
@@ -37,16 +39,28 @@ fn ctrl_mask(c: u8) -> u8 {
     c & 0x1f
 }
 
+struct Cursor {
+    /// The position of the cursor in the terminal window.
+    pos: Pos,
+    /// Since lines may take up several rows, the specific line with the cursor
+    /// cannot simply be calculated with `pos`, so the index of the line in the
+    /// lines list needs to be stored.
+    line: usize,
+    /// To the same reason as above, there is no way to retrieve the actual
+    /// byte in line under cursor, so the absolute offset from the line's start
+    /// needs to be stored here.
+    byte: usize,
+}
+
 struct Editor {
     // Note that this does not always report the actual position of the cursor.
     // Instead, it is the _desired_ position, i.e. what user sets. It may be
     // that for rendering purposes the cursor is temporarily relocated, but then
     // always set back to this position. This also means that when it's
     // temporarily relocated, this field shall not be updated.
-    cursor: Pos,
-    // The position of the bottom right corner of the window. This is used as
-    // window size.
-    bottom_right_corner: Pos,
+    cursor: Cursor,
+    window_width: usize,
+    window_height: usize,
     // Used to coalesce writes into a single buffer to then flush it in one go
     // to avoid excessive IO overhead.
     write_buf: Vec<u8>,
@@ -55,8 +69,11 @@ struct Editor {
     // the new-line character, as stored in the file, while a row is the
     // rendered string. This means a line may wrap several rows.
     lines: Vec<Vec<u8>>,
-    // The zero based index into `lines` of the first line to show.
-    line_offset: i32,
+    // The zero-based index into `lines` of the first line to show.
+    line_offset: usize,
+    // The first character of the row in line that should be drawn. Always
+    // a multiple of `window_width`. Also zero-based.
+    line_offset_char: usize,
 }
 
 fn init_log() {
@@ -83,11 +100,13 @@ fn log(buf: &[u8]) {
 impl Editor {
     pub fn new() -> Editor {
         Editor {
-            cursor: Pos { row: 1, col: 1 },
-            bottom_right_corner: Pos { row: 1, col: 1 },
+            cursor: Cursor { pos: Pos { row: 0, col: 0 }, line: 0, byte: 0 },
+            window_width: 0,
+            window_height: 0,
             write_buf: vec![],
             lines: vec![],
             line_offset: 0,
+            line_offset_char: 0,
         }
     }
 
@@ -98,7 +117,6 @@ impl Editor {
         if let Ok(mut file) = File::open(path) {
             let mut buf = vec![];
             file.read_to_end(&mut buf).unwrap();
-            log(&buf);
 
             // TODO might need to match \r\n as well
             let lines = buf.split(|b| *b == '\n' as u8);
@@ -146,30 +164,33 @@ impl Editor {
 
     fn handle_esc_seq_key(&mut self) {
         if let Some(key) = self.read_esc_seq_to_key() {
-            let n_lines = self.lines.len() as i32;
             match key {
-                Key::ArrowUp => self.cursor_down(),
-                Key::ArrowDown => self.cursor_up(),
+                Key::ArrowUp => self.cursor_up(),
+                Key::ArrowDown => self.cursor_down(),
                 Key::ArrowLeft => self.cursor_left(),
                 Key::ArrowRight => self.cursor_right(),
                 Key::PageUp => {
-                    for _ in 1..self.window_height() {
+                    let rows = cmp::min(self.window_height, self.cursor.pos.row);
+                    for _ in 0..rows {
                         self.cursor_up();
                     }
                 },
                 Key::PageDown => {
-                    for _ in 1..self.window_height() {
+                    let rows_left = self.lines.len() - self.cursor.pos.row;
+                    let rows = cmp::min(self.window_height, rows_left);
+                    for _ in 0..rows {
                         self.cursor_down();
                     }
                 },
                 Key::Home => {
-                    self.cursor = Pos { row: 1, col: 1 };
+                    // TODO adjust this to line wrapping
+                    self.cursor.pos = Pos { row: 0, col: 0 };
                     self.line_offset = 0;
                 }
                 Key::End => {
-                    self.cursor = Pos {  col: 1, row: self.window_height() };
-                    // FIXME for some reason there are 2 extra empty rows
-                    self.line_offset = n_lines - self.window_height();
+                    // TODO adjust this to line wrapping
+                    self.cursor.pos = Pos {  col: 0, row: self.window_height - 1 };
+                    self.line_offset = self.lines.len() - self.window_height;
                 }
                 _ => (),
             }
@@ -177,40 +198,125 @@ impl Editor {
     }
 
     fn cursor_down(&mut self) {
-        // If cursor is at the top of the window, we need to
-        // scroll.  This is handled by decrementing the
-        // line_offset if it's not already 0.
-        if self.cursor.row == 1 {
-            if self.line_offset > 0 {
-                self.line_offset -= 1;
-            }
-        } else {
-            self.cursor.row -= 1;
+        // Check if cursor is at the bottom of the window.
+        if self.cursor.pos.row == self.window_height - 1 {
+            self.scroll_down();
+        }
+
+        let line = &self.lines[self.cursor.line];
+        let curr_row_len = cmp::min(line.len(), self.window_width);
+        let bytes_left = line.len() - curr_row_len;
+        if bytes_left > 0 {
+            // We're at the end of the row but not at the end of the line, which
+            // is merely wrapped, so just go down one row but stay on the same
+            // line.
+            let next_row_len = {
+                if bytes_left > self.window_width {
+                    bytes_left - self.window_width
+                } else {
+                    bytes_left
+                }
+            };
+            assert!(next_row_len > 0);
+
+            let col = cmp::min(self.cursor.pos.col, next_row_len - 1);
+
+            self.cursor.pos.row += 1;
+            self.cursor.pos.col = col;
+            self.cursor.byte += col;
+        } else if self.cursor.line + 1 < self.lines.len() {
+            // We're at the end of the line so go down one row to the next
+            // line if cursor is not already on the last line.
+            self.cursor.line += 1;
+
+            let line = &self.lines[self.cursor.line];
+            // Next line might be shorter than current cursor column position.
+            let col = {
+                if line.is_empty() {
+                    0
+                } else {
+                    cmp::min(line.len() - 1, self.cursor.pos.col)
+                }
+            };
+
+            self.cursor.pos.row += 1;
+            self.cursor.pos.col = col;
+            self.cursor.byte = col;
+        }
+    }
+
+    fn scroll_down(&mut self) {
+        // The top row may be part of a wrapped line, so need to check if we
+        // need to advance to the next line or just adjust the byte offset
+        // from which to show the line.
+        if self.line_offset_char + self.window_width < self.lines[self.line_offset].len() {
+            self.line_offset_char += self.window_width;
+        } else if self.line_offset < self.lines.len() - 1 {
+            self.line_offset += 1;
+            self.line_offset_char = 0;
         }
     }
 
     fn cursor_up(&mut self) {
-        // If cursor is at the bottom of the window, we need
-        // to scroll. This is handled by incrementing the
-        // line_offset if it's not already pointing to the
-        // last row.
-        if self.cursor.row == self.window_height() {
-            if self.line_offset < n_lines {
-                self.line_offset += 1;
-            }
-        } else {
-            self.cursor.row += 1;
+        // Cursor may have reached the top of the window.
+        if self.cursor.pos.row == 0 {
+            self.scroll_up();
+        }
+
+        if self.line_offset_char > 0 {
+            assert!(self.line_offset_char >= self.window_width);
+            // Line is wrapped so we don't have to skip to the previous line,
+            // only the row.
+            self.cursor.byte -= self.window_width;
+            self.cursor.pos.row -= 1;
+            // TODO
+            // Theoretically the part of the line before this row must
+            // always be longer, so we don't need to change the col, but make
+            // sure.
+        } else if self.cursor.line > 0 {
+            // Cursor is on the first row of this line, so go to the previous
+            // line.
+            self.cursor.line -= 1;
+            // Previous line might be shorter than current cursor column position.
+            let col = {
+                let line = &self.lines[self.cursor.line];
+                if line.is_empty() {
+                    0
+                } else {
+                    cmp::min(line.len() - 1, self.cursor.pos.col)
+                }
+            };
+            self.cursor.pos.row -= 1;
+            self.cursor.pos.col = col;
+            self.cursor.byte = col;
+        }
+    }
+
+    fn scroll_up(&mut self) {
+        // The top row may be part of a wrapped line, so need to check if we
+        // need to advance to the previous row or just adjust the byte offset
+        // from which to show the line.
+        if self.line_offset_char > self.window_width {
+            self.line_offset -= self.window_width;
+        } else if self.line_offset > 0 {
+            self.line_offset -= 1;
+            self.line_offset_char = 0;
         }
     }
 
     fn cursor_left(&mut self) {
-        //if self.cursor.col > 1 => self.cursor.col -= 1,
+        if self.cursor.pos.col > 0 {
+            self.cursor.pos.col -= 1;
+            self.cursor.byte -= 1;
+        }
     }
 
     fn cursor_right(&mut self) {
-                //Key::ArrowRight if self.cursor.col < self.window_width() => {
-                    //self.cursor.col += 1
-                //}
+        if self.cursor.byte + 1 < self.lines[self.cursor.line].len()
+            && self.cursor.pos.col + 1 < self.window_width {
+            self.cursor.pos.col += 1;
+            self.cursor.byte += 1;
+        }
     }
 
     /// This function is called after encountering a \x1b escape character from
@@ -266,11 +372,11 @@ impl Editor {
         self.update_window_size();
         // Hide cursor while redrawing to avoid glitching.
         self.hide_cursor();
-        self.move_cursor(Pos { row: 1, col: 1 }); // Is this needed?
-                                                  // Append text to write buffer while clearing old data.
+        self.move_cursor(Pos { row: 0, col: 0 });
+        // Append text to write buffer while clearing old data.
         self.build_rows();
-        // (Rust giving me crap for directly passing self.cursor.)
-        let cursor = self.cursor;
+        // (Rust giving me crap for directly passing self.cursor.pos.)
+        let cursor = self.cursor.pos;
         // Move cursor back to its original position.
         self.move_cursor(cursor);
         self.show_cursor();
@@ -280,8 +386,9 @@ impl Editor {
 
     fn build_rows(&mut self) {
         let mut n_rows_drawn = 0;
-        for line in self.lines.iter().skip(self.line_offset as usize) {
-            if n_rows_drawn == self.window_height() {
+
+        for line in self.lines.iter().skip(self.line_offset) {
+            if n_rows_drawn == self.window_height {
                 break;
             }
 
@@ -291,38 +398,42 @@ impl Editor {
             // The line might be longer than the width of our window, so it needs
             // to be split accross rows and wrapped. Count how many bytes are left in
             // the row to draw.
-            let mut n_bytes_left = line.len() as i32;
+            let (mut n_bytes_left, mut offset) = {
+                if n_rows_drawn == 0 {
+                    // This is the first line to draw which may not be drawn
+                    // from its first byte if window begins after a wrap.
+                    (line.len() - self.line_offset_char, self.line_offset_char)
+                } else {
+                    (line.len(), 0)
+                }
+            };
 
-            // An empty line is just a line break.
             if n_bytes_left == 0 {
+                // An empty line is just a line break.
                 self.write_buf.extend_from_slice("\r\n".as_bytes());
                 n_rows_drawn += 1;
             } else {
-                let mut offset = 0;
-                while n_bytes_left > 0 {
-                    let end = offset + min(self.window_width(), n_bytes_left) as usize;
+                // Split up line into rows.
+                while n_bytes_left > 0 && n_rows_drawn < self.window_height {
+                    let end = offset + cmp::min(self.window_width, n_bytes_left);
                     let row = &line[offset..end];
 
                     offset += row.len();
-                    n_bytes_left -= row.len() as i32;
+                    n_bytes_left -= row.len();
+                    n_rows_drawn += 1;
 
                     self.write_buf.extend_from_slice(row);
                     // Don't put a new line on the last row.
-                    if n_rows_drawn < self.window_height() {
+                    if n_rows_drawn < self.window_height {
                         self.write_buf.extend_from_slice("\r\n".as_bytes());
                     }
-                    n_rows_drawn += 1;
                 }
             }
         }
 
         // There may not be enough text to fill all the rows of the window, so
         // fill the rest with '~'s.
-        let n_rows_left = self.window_height() - n_rows_drawn;
-        log(format!(
-            "rows: {} total, {} drawn, {} left",
-            self.window_height(), n_rows_drawn, n_rows_left
-        ).as_bytes());
+        let n_rows_left = self.window_height - n_rows_drawn;
         if n_rows_left > 0 {
             for _ in 1..(n_rows_left - 1) {
                 self.write_buf.extend_from_slice("~\r\n".as_bytes());
@@ -344,7 +455,7 @@ impl Editor {
     }
 
     fn move_cursor(&mut self, pos: Pos) {
-        self.defer_esc_seq(&format!("{};{}H", pos.row, pos.col));
+        self.defer_esc_seq(&format!("{};{}H", pos.row + 1, pos.col + 1));
     }
 
     fn hide_cursor(&mut self) {
@@ -374,14 +485,6 @@ impl Editor {
         println!("\x1b[{}", cmd);
     }
 
-    fn window_width(&self) -> i32 {
-        self.bottom_right_corner.col
-    }
-
-    fn window_height(&self) -> i32 {
-        self.bottom_right_corner.row
-    }
-
     fn update_window_size(&mut self) {
         // Move cursor as far right and down as we can (set_cursor_pos not used
         // on purpose as it uses a different escape sequence which does not
@@ -389,7 +492,9 @@ impl Editor {
         // window while this does).
         self.send_esc_seq("999C");
         self.send_esc_seq("999B");
-        self.bottom_right_corner = self.cursor_pos();
+        let bottom_right_corner = self.cursor_pos();
+        self.window_width = bottom_right_corner.col + 1;
+        self.window_height = bottom_right_corner.row + 1;
     }
 
     fn cursor_pos(&mut self) -> Pos {
@@ -421,7 +526,7 @@ impl Editor {
         let row_pos = response.find(char::is_numeric).unwrap();
         let semicolon_pos = response.find(';').unwrap();
         assert!(row_pos < semicolon_pos);
-        let row: i32 = response[row_pos..semicolon_pos].parse().unwrap();
+        let row: usize = response[row_pos..semicolon_pos].parse().unwrap();
 
         // Skip the first integer.
         assert!(semicolon_pos < response.len());
@@ -429,9 +534,9 @@ impl Editor {
 
         let col_pos = response.find(char::is_numeric).unwrap();
         assert!(col_pos < response.len());
-        let col: i32 = response[col_pos..].parse().unwrap();
+        let col: usize = response[col_pos..].parse().unwrap();
 
-        Pos { col, row }
+        Pos { col: col - 1, row: row - 1 }
     }
 }
 
