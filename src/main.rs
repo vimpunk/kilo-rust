@@ -208,18 +208,15 @@ impl Editor {
         }
 
         let line = &self.lines[self.cursor.line];
-        let curr_row_len = cmp::min(line.len(), self.window_width);
-        let bytes_left = line.len() - curr_row_len;
-        if bytes_left > 0 {
-            // We're at the end of the row but not at the end of the line, which
-            // is merely wrapped, so just go down one row but stay on the same
-            // line.
+        let bytes_till_eor = self.end_of_row() - self.cursor.pos.col;
+        let row_last_byte = self.cursor.byte + bytes_till_eor;
+
+        if row_last_byte + 1 < line.len() {
+            // We're not at the end of the line, which is merely wrapped, so
+            // just go down one row staying on the same line.
             let next_row_len = {
-                if bytes_left > self.window_width {
-                    bytes_left - self.window_width
-                } else {
-                    bytes_left
-                }
+                let bytes_left_in_line = line.len() - row_last_byte - 1;
+                cmp::min(bytes_left_in_line, self.window_width)
             };
             assert!(next_row_len > 0);
 
@@ -314,7 +311,7 @@ impl Editor {
 
     fn cursor_left(&mut self) {
         if self.cursor.pos.col > 0 {
-            if self.cursor.pos.col == self.end_of_line() {
+            if self.cursor.pos.col == self.end_of_row() {
                 self.cursor.is_at_eol = false;
             }
             self.cursor.pos.col -= 1;
@@ -327,13 +324,13 @@ impl Editor {
             && self.cursor.pos.col + 1 < self.window_width {
             self.cursor.pos.col += 1;
             self.cursor.byte += 1;
-            if self.cursor.pos.col == self.end_of_line() {
+            if self.cursor.pos.col == self.end_of_row() {
                 self.cursor.is_at_eol = true;
             }
         }
     }
 
-    fn end_of_line(&self) -> usize {
+    fn end_of_row(&self) -> usize {
         let line = &self.lines[self.cursor.line];
         if line.is_empty() {
             0
