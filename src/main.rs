@@ -220,7 +220,6 @@ impl Editor {
             assert!(next_row_len > 0);
 
             let col = cmp::min(self.cursor.pos.col, next_row_len - 1);
-
             self.cursor.pos.row += 1;
             self.cursor.pos.col = col;
             self.cursor.byte += col;
@@ -229,9 +228,9 @@ impl Editor {
             // line if cursor is not already on the last line.
             self.cursor.line += 1;
 
-            let line = &self.lines[self.cursor.line];
             // Next line might be shorter than current cursor column position.
             let col = {
+                let line = &self.lines[self.cursor.line];
                 if line.is_empty() {
                     0
                 } else {
@@ -263,8 +262,7 @@ impl Editor {
             self.scroll_up();
         }
 
-        if self.line_offset_char > 0 {
-            assert!(self.line_offset_char >= self.window_width);
+        if self.cursor.byte >= self.window_width {
             // Line is wrapped so we don't have to skip to the previous line,
             // only the row.
             self.cursor.byte -= self.window_width;
@@ -277,6 +275,7 @@ impl Editor {
             // Cursor is on the first row of this line, so go to the previous
             // line.
             self.cursor.line -= 1;
+
             // Previous line might be shorter than current cursor column position.
             let col = {
                 let line = &self.lines[self.cursor.line];
@@ -286,6 +285,7 @@ impl Editor {
                     cmp::min(line.len() - 1, self.cursor.pos.col)
                 }
             };
+
             self.cursor.pos.row -= 1;
             self.cursor.pos.col = col;
             self.cursor.byte = col;
