@@ -50,6 +50,10 @@ struct Cursor {
     /// byte in line under cursor, so the absolute offset from the line's start
     /// needs to be stored here.
     byte: usize,
+    /// In order to be able to go up and down along the ends of lines of
+    /// different lengths (including 0), this flag needs to be set to determine
+    /// whether to go to the same column in the next row or to its end.
+    is_at_eol: bool,
 }
 
 struct Editor {
@@ -100,7 +104,7 @@ fn log(buf: &[u8]) {
 impl Editor {
     pub fn new() -> Editor {
         Editor {
-            cursor: Cursor { pos: Pos { row: 0, col: 0 }, line: 0, byte: 0 },
+            cursor: Cursor { pos: Pos { row: 0, col: 0 }, line: 0, byte: 0, is_at_eol: false },
             window_width: 0,
             window_height: 0,
             write_buf: vec![],
@@ -233,6 +237,8 @@ impl Editor {
                 let line = &self.lines[self.cursor.line];
                 if line.is_empty() {
                     0
+                } else if self.cursor.is_at_eol {
+                    cmp::min(line.len(), self.window_width) - 1
                 } else {
                     cmp::min(line.len() - 1, self.cursor.pos.col)
                 }
@@ -281,6 +287,8 @@ impl Editor {
                 let line = &self.lines[self.cursor.line];
                 if line.is_empty() {
                     0
+                } else if self.cursor.is_at_eol {
+                    cmp::min(line.len(), self.window_width) - 1
                 } else {
                     cmp::min(line.len() - 1, self.cursor.pos.col)
                 }
@@ -294,7 +302,7 @@ impl Editor {
 
     fn scroll_up(&mut self) {
         // The top row may be part of a wrapped line, so need to check if we
-        // need to advance to the previous row or just adjust the byte offset
+        // need to advance to the previous line or just adjust the byte offset
         // from which to show the line.
         if self.line_offset_char > self.window_width {
             self.line_offset -= self.window_width;
@@ -306,6 +314,9 @@ impl Editor {
 
     fn cursor_left(&mut self) {
         if self.cursor.pos.col > 0 {
+            if self.cursor.pos.col == self.end_of_line() {
+                self.cursor.is_at_eol = false;
+            }
             self.cursor.pos.col -= 1;
             self.cursor.byte -= 1;
         }
@@ -316,6 +327,19 @@ impl Editor {
             && self.cursor.pos.col + 1 < self.window_width {
             self.cursor.pos.col += 1;
             self.cursor.byte += 1;
+            if self.cursor.pos.col == self.end_of_line() {
+                self.cursor.is_at_eol = true;
+            }
+        }
+    }
+
+    fn end_of_line(&self) -> usize {
+        let line = &self.lines[self.cursor.line];
+        if line.is_empty() {
+            0
+        } else {
+            assert!(self.window_width > 0);
+            cmp::min(line.len(), self.window_width) - 1
         }
     }
 
