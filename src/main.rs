@@ -203,27 +203,38 @@ impl Editor {
 
     fn cursor_down(&mut self) {
         // Check if cursor is at the bottom of the window.
+        // FIXME doesn't work
         if self.cursor.pos.row == self.window_height - 1 {
             self.scroll_down();
         }
 
-        let line = &self.lines[self.cursor.line];
-        let bytes_till_eor = self.end_of_row() - self.cursor.pos.col;
-        let row_last_byte = self.cursor.byte + bytes_till_eor;
+        // Note that this is indexed from the beginning of the line, whereas
+        // end_of_row is indexed from the beginning of the row.
+        let row_last_byte = self.cursor.byte + self.end_of_row() - self.cursor.pos.col;
+        let bytes_left_in_line = {
+            let line_len = self.lines[self.cursor.line].len();
+            if row_last_byte + 1 >= line_len {
+                0
+            } else {
+                line_len - row_last_byte - 1
+            }
+        };
 
-        if row_last_byte + 1 < line.len() {
+        if bytes_left_in_line > 0 {
             // We're not at the end of the line, which is merely wrapped, so
             // just go down one row staying on the same line.
-            let next_row_len = {
-                let bytes_left_in_line = line.len() - row_last_byte - 1;
-                cmp::min(bytes_left_in_line, self.window_width)
+            let next_row_len = cmp::min(bytes_left_in_line, self.window_width);
+            let col = {
+                if self.cursor.is_at_eol {
+                    next_row_len - 1
+                } else {
+                    cmp::min(self.cursor.pos.col, next_row_len - 1)
+                }
             };
-            assert!(next_row_len > 0);
 
-            let col = cmp::min(self.cursor.pos.col, next_row_len - 1);
             self.cursor.pos.row += 1;
             self.cursor.pos.col = col;
-            self.cursor.byte += col;
+            self.cursor.byte = row_last_byte + 1 + col;
         } else if self.cursor.line + 1 < self.lines.len() {
             // We're at the end of the line so go down one row to the next
             // line if cursor is not already on the last line.
@@ -270,30 +281,49 @@ impl Editor {
             // only the row.
             self.cursor.byte -= self.window_width;
             self.cursor.pos.row -= 1;
-            // TODO
-            // Theoretically the part of the line before this row must
-            // always be longer, so we don't need to change the col, but make
-            // sure.
         } else if self.cursor.line > 0 {
             // Cursor is on the first row of this line, so go to the previous
             // line.
             self.cursor.line -= 1;
-
-            // Previous line might be shorter than current cursor column position.
-            let col = {
-                let line = &self.lines[self.cursor.line];
-                if line.is_empty() {
-                    0
-                } else if self.cursor.is_at_eol {
-                    cmp::min(line.len(), self.window_width) - 1
-                } else {
-                    cmp::min(line.len() - 1, self.cursor.pos.col)
-                }
-            };
-
             self.cursor.pos.row -= 1;
-            self.cursor.pos.col = col;
-            self.cursor.byte = col;
+
+            // Previous line might be shorter than current cursor column
+            // position, in which case the cursor needs to be moved to its end,
+            // or it might be wrapping, in which case the cursor needs to be
+            // positioned on the last wrap of the line.
+            let line = &self.lines[self.cursor.line];
+            if line.is_empty() {
+                self.cursor.pos.col = 0;
+                self.cursor.byte = 0;
+            } else {
+                if line.len() <= self.window_width {
+                    let col = {
+                        if self.cursor.is_at_eol {
+                            line.len() - 1
+                        } else {
+                            cmp::min(line.len() - 1, self.cursor.pos.col)
+                        }
+                    };
+
+                    self.cursor.pos.col = col;
+                    self.cursor.byte = col;
+                } else {
+                    // Use integer truncation to first get the number of full
+                    // rows this line is broken up into.
+                    let last_row_first_byte = (line.len() / self.window_width) * self.window_width;
+                    let col = {
+                        let last_row_len = line.len() - last_row_first_byte;
+                        if self.cursor.is_at_eol {
+                            last_row_len - 1
+                        } else {
+                            cmp::min(last_row_len - 1, self.cursor.pos.col)
+                        }
+                    };
+
+                    self.cursor.byte = last_row_first_byte + col;
+                    self.cursor.pos.col = col;
+                }
+            }
         }
     }
 
