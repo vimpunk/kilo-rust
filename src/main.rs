@@ -77,7 +77,7 @@ struct Editor {
     line_offset: usize,
     // The first character of the row in line that should be drawn. Always
     // a multiple of `window_width`. Also zero-based.
-    line_offset_char: usize,
+    line_offset_byte: usize,
 }
 
 fn init_log() {
@@ -110,7 +110,7 @@ impl Editor {
             write_buf: vec![],
             lines: vec![],
             line_offset: 0,
-            line_offset_char: 0,
+            line_offset_byte: 0,
         }
     }
 
@@ -162,7 +162,7 @@ impl Editor {
     fn handle_key(&mut self, c: char) {
         match c {
             '\x1b' => self.handle_esc_seq_key(),
-            _ => self.handle_input()
+            _ => self.handle_input(c)
         }
     }
 
@@ -262,11 +262,11 @@ impl Editor {
         // The top row may be part of a wrapped line, so need to check if we
         // need to advance to the next line or just adjust the byte offset
         // from which to show the line.
-        if self.line_offset_char + self.window_width < self.lines[self.line_offset].len() {
-            self.line_offset_char += self.window_width;
+        if self.line_offset_byte + self.window_width < self.lines[self.line_offset].len() {
+            self.line_offset_byte += self.window_width;
         } else if self.line_offset < self.lines.len() - 1 {
             self.line_offset += 1;
-            self.line_offset_char = 0;
+            self.line_offset_byte = 0;
         }
     }
 
@@ -331,11 +331,11 @@ impl Editor {
         // The top row may be part of a wrapped line, so need to check if we
         // need to advance to the previous line or just adjust the byte offset
         // from which to show the line.
-        if self.line_offset_char > self.window_width {
+        if self.line_offset_byte > self.window_width {
             self.line_offset -= self.window_width;
         } else if self.line_offset > 0 {
             self.line_offset -= 1;
-            self.line_offset_char = 0;
+            self.line_offset_byte = 0;
         }
     }
 
@@ -414,7 +414,7 @@ impl Editor {
         None
     }
 
-    fn handle_input(&mut self) {
+    fn handle_input(&mut self, c: char) {
     }
 
     fn refresh_screen(&mut self) {
@@ -443,9 +443,6 @@ impl Editor {
                 break;
             }
 
-            // Clear row.
-            self.write_buf.extend_from_slice("\x1b[K".as_bytes());
-
             // The line might be longer than the width of our window, so it needs
             // to be split accross rows and wrapped. Count how many bytes are left in
             // the row to draw.
@@ -453,19 +450,25 @@ impl Editor {
                 if n_rows_drawn == 0 {
                     // This is the first line to draw which may not be drawn
                     // from its first byte if window begins after a wrap.
-                    (line.len() - self.line_offset_char, self.line_offset_char)
+                    (line.len() - self.line_offset_byte, self.line_offset_byte)
                 } else {
                     (line.len(), 0)
                 }
             };
 
             if n_bytes_left == 0 {
+                // Clear row.
+                self.write_buf.extend_from_slice("\x1b[K".as_bytes());
                 // An empty line is just a line break.
                 self.write_buf.extend_from_slice("\r\n".as_bytes());
                 n_rows_drawn += 1;
             } else {
                 // Split up line into rows.
                 while n_bytes_left > 0 && n_rows_drawn < self.window_height {
+                    // Clear row.
+                    // TODO we should use self.clear_row function but can't due to ownership
+                    self.write_buf.extend_from_slice("\x1b[K".as_bytes());
+
                     let end = offset + cmp::min(self.window_width, n_bytes_left);
                     let row = &line[offset..end];
 
@@ -488,13 +491,13 @@ impl Editor {
         if n_rows_left > 0 {
             for _ in 1..(n_rows_left - 1) {
                 self.write_buf.extend_from_slice("~\r\n".as_bytes());
-                self.clear_line();
+                self.clear_row();
             }
 
             // Don't put a new line on our last row as that will make the terminal
             // scroll down.
             self.write_buf.extend_from_slice("~".as_bytes());
-            self.clear_line();
+            self.clear_row();
         }
     }
 
@@ -521,7 +524,7 @@ impl Editor {
         self.defer_esc_seq("2J");
     }
 
-    fn clear_line(&mut self) {
+    fn clear_row(&mut self) {
         self.defer_esc_seq("K");
     }
 
