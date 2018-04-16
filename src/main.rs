@@ -174,16 +174,22 @@ impl Editor {
                 Key::ArrowLeft => self.cursor_left(),
                 Key::ArrowRight => self.cursor_right(),
                 Key::PageUp => {
-                    let rows = cmp::min(self.window_height, self.cursor.pos.row);
-                    for _ in 0..rows {
+                    let n_rows = cmp::min(self.window_height, self.cursor.pos.row);
+                    for _ in 0..n_rows {
                         self.cursor_up();
                     }
                 },
                 Key::PageDown => {
-                    let rows_left = self.lines.len() - self.cursor.pos.row;
-                    let rows = cmp::min(self.window_height, rows_left);
-                    for _ in 0..rows {
+                    //let lines_left = self.lines.len() - self.cursor.line;
+                    //let at_least_n_rows = cmp::min(self.window_height, lines_left);
+                    let mut rows_left = self.window_height;
+                    while rows_left > 0 {
+                        let cursor_row = self.cursor.pos.row;
                         self.cursor_down();
+                        if self.cursor.pos.row == cursor_row {
+                            break;
+                        }
+                        rows_left -= 1;
                     }
                 },
                 Key::Home => {
@@ -211,7 +217,7 @@ impl Editor {
         // Note that this is indexed from the beginning of the line, whereas
         // end_of_row is indexed from the beginning of the row.
         let row_last_byte = self.cursor.byte + self.end_of_row() - self.cursor.pos.col;
-        let bytes_left_in_line = {
+        let next_rows_len = {
             let line_len = self.lines[self.cursor.line].len();
             if row_last_byte + 1 >= line_len {
                 0
@@ -220,10 +226,14 @@ impl Editor {
             }
         };
 
-        if bytes_left_in_line > 0 {
+        if next_rows_len > 0 {
             // We're not at the end of the line, which is merely wrapped, so
             // just go down one row staying on the same line.
-            let next_row_len = cmp::min(bytes_left_in_line, self.window_width);
+            if self.cursor.pos.row + 1 < self.window_height {
+                self.cursor.pos.row += 1;
+            }
+
+            let next_row_len = cmp::min(next_rows_len, self.window_width);
             let col = {
                 if self.cursor.is_at_eol {
                     next_row_len - 1
@@ -232,13 +242,15 @@ impl Editor {
                 }
             };
 
-            self.cursor.pos.row += 1;
             self.cursor.pos.col = col;
             self.cursor.byte = row_last_byte + 1 + col;
         } else if self.cursor.line + 1 < self.lines.len() {
-            // We're at the end of the line so go down one row to the next
-            // line if cursor is not already on the last line.
+            // Go down one row to the next line if cursor is not already on the
+            // last line.
             self.cursor.line += 1;
+            if self.cursor.pos.row + 1 < self.window_height {
+                self.cursor.pos.row += 1;
+            }
 
             // Next line might be shorter than current cursor column position.
             let col = {
@@ -252,7 +264,6 @@ impl Editor {
                 }
             };
 
-            self.cursor.pos.row += 1;
             self.cursor.pos.col = col;
             self.cursor.byte = col;
         }
@@ -280,12 +291,16 @@ impl Editor {
             // Line is wrapped so we don't have to skip to the previous line,
             // only the row.
             self.cursor.byte -= self.window_width;
-            self.cursor.pos.row -= 1;
+            if self.cursor.pos.row > 0 {
+                self.cursor.pos.row -= 1;
+            }
         } else if self.cursor.line > 0 {
             // Cursor is on the first row of this line, so go to the previous
             // line.
             self.cursor.line -= 1;
-            self.cursor.pos.row -= 1;
+            if self.cursor.pos.row > 0 {
+                self.cursor.pos.row -= 1;
+            }
 
             // Previous line might be shorter than current cursor column
             // position, in which case the cursor needs to be moved to its end,
