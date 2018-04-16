@@ -173,25 +173,8 @@ impl Editor {
                 Key::ArrowDown => self.cursor_down(),
                 Key::ArrowLeft => self.cursor_left(),
                 Key::ArrowRight => self.cursor_right(),
-                Key::PageUp => {
-                    let n_rows = cmp::min(self.window_height, self.cursor.pos.row);
-                    for _ in 0..n_rows {
-                        self.cursor_up();
-                    }
-                },
-                Key::PageDown => {
-                    //let lines_left = self.lines.len() - self.cursor.line;
-                    //let at_least_n_rows = cmp::min(self.window_height, lines_left);
-                    let mut rows_left = self.window_height;
-                    while rows_left > 0 {
-                        let cursor_row = self.cursor.pos.row;
-                        self.cursor_down();
-                        if self.cursor.pos.row == cursor_row {
-                            break;
-                        }
-                        rows_left -= 1;
-                    }
-                },
+                Key::PageUp => self.page_up(),
+                Key::PageDown => self.page_down(),
                 Key::Home => {
                     // TODO adjust this to line wrapping
                     self.cursor.pos = Pos { row: 0, col: 0 };
@@ -207,9 +190,27 @@ impl Editor {
         }
     }
 
+    fn page_down(&mut self) {
+        //let lines_left = self.lines.len() - self.cursor.line;
+        //let at_least_n_rows = cmp::min(self.window_height, lines_left);
+        let mut n_rows_left = self.window_height - 1;
+        while n_rows_left > 0 && self.cursor.line < self.lines.len() {
+            self.cursor_down();
+            n_rows_left -= 1;
+        }
+    }
+
+    fn page_up(&mut self) {
+        let mut n_rows_left = self.window_height - 1;
+        //let n_rows = cmp::min(self.window_height, self.cursor.pos.row);
+        while n_rows_left > 0 && self.cursor.line > 0 {
+            self.cursor_up();
+            n_rows_left -= 1;
+        }
+    }
+
     fn cursor_down(&mut self) {
         // Check if cursor is at the bottom of the window.
-        // FIXME doesn't work
         if self.cursor.pos.row == self.window_height - 1 {
             self.scroll_down();
         }
@@ -275,7 +276,7 @@ impl Editor {
         // from which to show the line.
         if self.line_offset_byte + self.window_width < self.lines[self.line_offset].len() {
             self.line_offset_byte += self.window_width;
-        } else if self.line_offset < self.lines.len() - 1 {
+        } else if self.line_offset + self.window_height < self.lines.len() {
             self.line_offset += 1;
             self.line_offset_byte = 0;
         }
