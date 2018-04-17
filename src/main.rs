@@ -276,7 +276,7 @@ impl Editor {
         // from which to show the line.
         if self.line_offset_byte + self.window_width < self.lines[self.line_offset].len() {
             self.line_offset_byte += self.window_width;
-        } else if self.line_offset + self.window_height < self.lines.len() {
+        } else if self.line_offset + self.window_height + 1 < self.lines.len() {
             self.line_offset += 1;
             self.line_offset_byte = 0;
         }
