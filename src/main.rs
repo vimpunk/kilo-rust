@@ -216,15 +216,11 @@ impl Editor {
         }
 
         // Note that this is indexed from the beginning of the line, whereas
-        // end_of_row is indexed from the beginning of the row.
-        let row_last_byte = self.cursor.byte + self.end_of_row() - self.cursor.pos.col;
+        // curr_row_last_pos is indexed from the beginning of the row.
+        let row_last_byte = self.cursor.byte + self.curr_row_last_pos() - self.cursor.pos.col;
         let next_rows_len = {
             let line_len = self.lines[self.cursor.line].len();
-            if row_last_byte + 1 >= line_len {
-                0
-            } else {
-                line_len - row_last_byte - 1
-            }
+            if row_last_byte + 1 >= line_len { 0 } else { line_len - row_last_byte - 1 }
         };
 
         if next_rows_len > 0 {
@@ -357,7 +353,7 @@ impl Editor {
 
     fn cursor_left(&mut self) {
         if self.cursor.pos.col > 0 {
-            if self.cursor.pos.col == self.end_of_row() {
+            if self.cursor.pos.col == self.curr_row_last_pos() {
                 self.cursor.is_at_eol = false;
             }
             self.cursor.pos.col -= 1;
@@ -370,13 +366,13 @@ impl Editor {
             && self.cursor.pos.col + 1 < self.window_width {
             self.cursor.pos.col += 1;
             self.cursor.byte += 1;
-            if self.cursor.pos.col == self.end_of_row() {
+            if self.cursor.pos.col == self.curr_row_last_pos() {
                 self.cursor.is_at_eol = true;
             }
         }
     }
 
-    fn end_of_row(&self) -> usize {
+    fn curr_row_last_pos(&self) -> usize {
         let line = &self.lines[self.cursor.line];
         if line.is_empty() {
             0
