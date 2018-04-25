@@ -39,6 +39,7 @@ fn ctrl_mask(c: u8) -> u8 {
     c & 0x1f
 }
 
+#[derive(Debug)]
 struct Cursor {
     /// The position of the cursor in the terminal window.
     pos: Pos,
@@ -80,27 +81,6 @@ struct Editor {
     line_offset_byte: usize,
 }
 
-fn init_log() {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open("/tmp/kilo-rust.log")
-        .unwrap();
-}
-
-fn log(buf: &[u8]) {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .append(true)
-        .open("/tmp/kilo-rust.log")
-        .unwrap();
-    file.write("NEW LOG ENTRY\n".as_bytes()).unwrap();
-    file.write(&buf).unwrap();
-    file.write("\n".as_bytes()).unwrap();
-    file.flush().unwrap();
-}
-
 impl Editor {
     pub fn new() -> Editor {
         Editor {
@@ -123,7 +103,14 @@ impl Editor {
             file.read_to_end(&mut buf).unwrap();
 
             // TODO might need to match \r\n as well
+            // FIXME there's an extra empty space at the end even if there shouldn't be
             let lines = buf.split(|b| *b == '\n' as u8);
+            //if let Some(last_line) = lines.last() {
+                //if let Some(last_byte) = last_line.last() {
+                    //// TODO remove last character
+                //}
+            //}
+
             // Try to get an esimate of the number of lines in file.
             let size_hint = {
                 let (lower, upper) = lines.size_hint();
@@ -137,6 +124,11 @@ impl Editor {
             editor.lines = lines
                 .map(|line| line.to_vec())
                 .collect();
+
+            let dbg_lines: Vec<String> = editor.lines.iter()
+                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                .collect();
+            log(format!("file ({} lines):\n{:?}", editor.lines.len(), dbg_lines).as_bytes());
         }
 
         editor
@@ -178,6 +170,8 @@ impl Editor {
                 Key::Home => {
                     // TODO adjust this to line wrapping
                     self.cursor.pos = Pos { row: 0, col: 0 };
+                    self.cursor.line = 0;
+                    self.cursor.byte = 0;
                     self.line_offset = 0;
                 }
                 Key::End => {
@@ -209,19 +203,20 @@ impl Editor {
         }
     }
 
+    /// Moves the cursor down by one row, if possible.
     fn cursor_down(&mut self) {
         // Check if cursor is at the bottom of the window.
-        if self.cursor.pos.row == self.window_height - 1 {
+        if self.cursor.pos.row + 1 == self.window_height {
             self.scroll_down();
         }
 
         // Note that this is indexed from the beginning of the line, whereas
-        // curr_row_last_pos is indexed from the beginning of the row.
-        let row_last_byte = self.cursor.byte + self.curr_row_last_pos() - self.cursor.pos.col;
-        let next_rows_len = {
-            let line_len = self.lines[self.cursor.line].len();
-            if row_last_byte + 1 >= line_len { 0 } else { line_len - row_last_byte - 1 }
-        };
+        // curr_last_pos_row_offset is indexed from the beginning of the row.
+        let next_rows_len = self.curr_line_next_rows_len();
+
+        log(format!("DOWN: cursor: {:?}, row_last_byte: {}, next_rows_len: {}, line_offset: {}, line_offset_byte: {}, line.len: {}",
+                    self.cursor, self.curr_last_pos_line_offset(), next_rows_len, self.line_offset,
+                    self.line_offset_byte, self.lines[self.cursor.line].len()).as_bytes());
 
         if next_rows_len > 0 {
             // We're not at the end of the line, which is merely wrapped, so
@@ -239,8 +234,10 @@ impl Editor {
                 }
             };
 
+            log(format!("DOWN|wrap: next_row_len: {}, col: {}", next_row_len, col).as_bytes());
+
             self.cursor.pos.col = col;
-            self.cursor.byte = row_last_byte + 1 + col;
+            self.cursor.byte = self.curr_last_pos_line_offset() + 1 + col;
         } else if self.cursor.line + 1 < self.lines.len() {
             // Go down one row to the next line if cursor is not already on the
             // last line.
@@ -261,23 +258,40 @@ impl Editor {
                 }
             };
 
+            log(format!("DOWN|new-line: col: {}", col).as_bytes());
+
             self.cursor.pos.col = col;
             self.cursor.byte = col;
         }
     }
 
+    /// Shifts the window down by one row, but does not affect the cursor position.
     fn scroll_down(&mut self) {
-        // The top row may be part of a wrapped line, so need to check if we
-        // need to advance to the next line or just adjust the byte offset
-        // from which to show the line.
-        if self.line_offset_byte + self.window_width < self.lines[self.line_offset].len() {
-            self.line_offset_byte += self.window_width;
-        } else if self.line_offset + self.window_height + 1 < self.lines.len() {
-            self.line_offset += 1;
-            self.line_offset_byte = 0;
+        // Only scroll down if there's at least one line left, or if we're on
+        // the last line but it's wrapped, so we can scroll to its next row.
+        if self.cursor.line + 1 < self.lines.len() || self.curr_line_next_rows_len() > 0 {
+            // The top row may be part of a wrapped line, so need to check if we
+            // need to advance to the next line or just adjust the byte offset
+            // from which to show the line.
+            if self.line_offset_byte + self.window_width < self.lines[self.line_offset].len() {
+                self.line_offset_byte += self.window_width;
+                self.cursor.pos.row -= 1;
+                log(format!("DOWN|scroll|wrap: line_offset: {}, line_offset_byte: {}, curr_line_next_rows_len: {}",
+                            self.line_offset, self.line_offset_byte, self.curr_line_next_rows_len()).as_bytes());
+            } else {
+                self.line_offset += 1;
+                self.line_offset_byte = 0;
+                log(format!("DOWN|scroll|new-line: line_offset: {}, line_offset_byte: {}, self.cursor.line: {}",
+                            self.line_offset, self.line_offset_byte, self.cursor.line).as_bytes());
+            }
+            // Since this shifts the whole window by one and cursor's position is relative to the
+            // window's top, we need to subtract one from cursor's row position to keep it in the
+            // same place it had been prior to this call.
+            self.cursor.pos.row -= 1;
         }
     }
 
+    /// Moves the cursor up by one row, if possible.
     fn cursor_up(&mut self) {
         // Cursor may have reached the top of the window.
         if self.cursor.pos.row == 0 {
@@ -339,21 +353,30 @@ impl Editor {
         }
     }
 
+    /// Shifts the window up by one row, but does not affect the cursor position.
     fn scroll_up(&mut self) {
         // The top row may be part of a wrapped line, so need to check if we
         // need to advance to the previous line or just adjust the byte offset
         // from which to show the line.
         if self.line_offset_byte > self.window_width {
             self.line_offset -= self.window_width;
+            self.cursor.pos.row += 1;
         } else if self.line_offset > 0 {
             self.line_offset -= 1;
-            self.line_offset_byte = 0;
+            self.cursor.pos.row += 1;
+            // If the previous line is wrapped, it must not be drawn from its first byte.
+            let line = &self.lines[self.line_offset];
+            if line.len() > self.window_width {
+                self.line_offset_byte = (line.len() / self.window_width) * (self.window_width - 1);
+            } else {
+                self.line_offset_byte = 0;
+            }
         }
     }
 
     fn cursor_left(&mut self) {
         if self.cursor.pos.col > 0 {
-            if self.cursor.pos.col == self.curr_row_last_pos() {
+            if self.cursor.pos.col == self.curr_last_pos_row_offset() {
                 self.cursor.is_at_eol = false;
             }
             self.cursor.pos.col -= 1;
@@ -366,13 +389,14 @@ impl Editor {
             && self.cursor.pos.col + 1 < self.window_width {
             self.cursor.pos.col += 1;
             self.cursor.byte += 1;
-            if self.cursor.pos.col == self.curr_row_last_pos() {
+            if self.cursor.pos.col == self.curr_last_pos_row_offset() {
                 self.cursor.is_at_eol = true;
             }
         }
     }
 
-    fn curr_row_last_pos(&self) -> usize {
+    /// Returns the position of the last byte in the row under the cursor.
+    fn curr_last_pos_row_offset(&self) -> usize {
         let line = &self.lines[self.cursor.line];
         if line.is_empty() {
             0
@@ -380,6 +404,20 @@ impl Editor {
             assert!(self.window_width > 0);
             cmp::min(line.len(), self.window_width) - 1
         }
+    }
+
+    /// Similary to curr_last_pos_row_offset, but returns the that position's aboslute
+    /// offset from the line's start.
+    fn curr_last_pos_line_offset(&self) -> usize {
+        self.cursor.byte + self.curr_last_pos_row_offset() - self.cursor.pos.col
+    }
+
+    /// Returns the total number of bytes of all rows in this line after the row
+    /// under the cursor.
+    fn curr_line_next_rows_len(&self) -> usize {
+        let line_len = self.lines[self.cursor.line].len();
+        let row_last_byte = self.curr_last_pos_line_offset();
+        if row_last_byte + 1 >= line_len { 0 } else { line_len - row_last_byte - 1 }
     }
 
     /// This function is called after encountering a \x1b escape character from
@@ -471,9 +509,14 @@ impl Editor {
             if n_bytes_left == 0 {
                 // Clear row.
                 self.write_buf.extend_from_slice("\x1b[K".as_bytes());
-                // An empty line is just a line break.
-                self.write_buf.extend_from_slice("\r\n".as_bytes());
                 n_rows_drawn += 1;
+                // An empty line is just a line break.
+                if n_rows_drawn < self.window_height {
+                    self.write_buf.extend_from_slice("\r\n".as_bytes());
+                } else {
+                    // Can't draw empty line, so substitute with a space. TODO
+                    self.write_buf.extend_from_slice(" ".as_bytes());
+                }
             } else {
                 // Split up line into rows.
                 while n_bytes_left > 0 && n_rows_drawn < self.window_height {
@@ -483,12 +526,17 @@ impl Editor {
 
                     let end = offset + cmp::min(self.window_width, n_bytes_left);
                     let row = &line[offset..end];
+                    assert!(row.len() > 0);
+
+                    log(format!("bytes left: {}, offset: {}, row.len: {}",
+                            n_bytes_left, offset, row.len()).as_bytes());
+
+                    self.write_buf.extend_from_slice(row);
 
                     offset += row.len();
                     n_bytes_left -= row.len();
                     n_rows_drawn += 1;
 
-                    self.write_buf.extend_from_slice(row);
                     // Don't put a new line on the last row.
                     if n_rows_drawn < self.window_height {
                         self.write_buf.extend_from_slice("\r\n".as_bytes());
@@ -497,11 +545,13 @@ impl Editor {
             }
         }
 
+        log(format!("window height: {}, rows drawn: {}",
+                    self.window_height, n_rows_drawn).as_bytes());
         // There may not be enough text to fill all the rows of the window, so
         // fill the rest with '~'s.
-        let n_rows_left = self.window_height - n_rows_drawn;
-        if n_rows_left > 0 {
-            for _ in 1..(n_rows_left - 1) {
+        let n_empty_rows = self.window_height - n_rows_drawn;
+        if n_empty_rows > 0 {
+            for _ in 1..(n_empty_rows - 1) {
                 self.write_buf.extend_from_slice("~\r\n".as_bytes());
                 self.clear_row();
             }
@@ -611,6 +661,27 @@ impl Drop for Editor {
         // Restore user's screen.
         self.clear_screen();
     }
+}
+
+fn init_log() {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("/tmp/kilo-rust.log")
+        .unwrap();
+}
+
+fn log(buf: &[u8]) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open("/tmp/kilo-rust.log")
+        .unwrap();
+    file.write("\n>>NEW LOG ENTRY\n".as_bytes()).unwrap();
+    file.write(&buf).unwrap();
+    file.write("\n".as_bytes()).unwrap();
+    file.flush().unwrap();
 }
 
 fn main() {
