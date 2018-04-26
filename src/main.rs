@@ -296,9 +296,17 @@ impl Editor {
         if self.cursor.byte >= self.window_width {
             // Line is wrapped so we don't have to skip to the previous line,
             // only the row.
-            self.cursor.byte -= self.window_width;
             if self.cursor.pos.row > 0 {
                 self.cursor.pos.row -= 1;
+            }
+
+            if self.cursor.is_at_eol {
+                // Get the total length of the previous rows and subtract one to get the last
+                // byte's offset in line of the previous row's last byte.
+                self.cursor.byte = (self.cursor.byte / self.window_width) * self.window_width - 1;
+                self.cursor.pos.col = self.cursor.byte % self.window_width;
+            } else {
+                self.cursor.byte -= self.window_width;
             }
         } else if self.cursor.line > 0 {
             // Cursor is on the first row of this line, so go to the previous
@@ -310,7 +318,7 @@ impl Editor {
 
             // Previous line might be shorter than current cursor column
             // position, in which case the cursor needs to be moved to its end,
-            // or it might be wrapping, in which case the cursor needs to be
+            // and it might be wrapping, in which case the cursor needs to be
             // positioned on the last wrap of the line.
             let line = &self.lines[self.cursor.line];
             if line.is_empty() {
@@ -353,16 +361,16 @@ impl Editor {
         // The top row may be part of a wrapped line, so need to check if we
         // need to advance to the previous line or just adjust the byte offset
         // from which to show the line.
-        if self.line_offset_byte > self.window_width {
-            self.line_offset -= self.window_width;
-            self.cursor.pos.row += 1;
+        if self.line_offset_byte >= self.window_width {
+            self.line_offset_byte -= self.window_width;
+            //self.cursor.pos.row += 1;
         } else if self.line_offset > 0 {
             self.line_offset -= 1;
-            self.cursor.pos.row += 1;
+            //self.cursor.pos.row += 1;
             // If the previous line is wrapped, it must not be drawn from its first byte.
             let line = &self.lines[self.line_offset];
             if line.len() > self.window_width {
-                self.line_offset_byte = (line.len() / self.window_width) * (self.window_width - 1);
+                self.line_offset_byte = (line.len() / self.window_width) * self.window_width;
             } else {
                 self.line_offset_byte = 0;
             }
