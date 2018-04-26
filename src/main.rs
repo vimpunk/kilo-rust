@@ -105,11 +105,6 @@ impl Editor {
             // TODO might need to match \r\n as well
             // FIXME there's an extra empty space at the end even if there shouldn't be
             let lines = buf.split(|b| *b == '\n' as u8);
-            //if let Some(last_line) = lines.last() {
-                //if let Some(last_byte) = last_line.last() {
-                    //// TODO remove last character
-                //}
-            //}
 
             // Try to get an esimate of the number of lines in file.
             let size_hint = {
@@ -283,11 +278,11 @@ impl Editor {
                 self.line_offset_byte = 0;
                 log(format!("DOWN|scroll|new-line: line_offset: {}, line_offset_byte: {}, self.cursor.line: {}",
                             self.line_offset, self.line_offset_byte, self.cursor.line).as_bytes());
+                self.cursor.pos.row -= 1;
             }
             // Since this shifts the whole window by one and cursor's position is relative to the
             // window's top, we need to subtract one from cursor's row position to keep it in the
             // same place it had been prior to this call.
-            self.cursor.pos.row -= 1;
         }
     }
 
@@ -514,7 +509,7 @@ impl Editor {
                 if n_rows_drawn < self.window_height {
                     self.write_buf.extend_from_slice("\r\n".as_bytes());
                 } else {
-                    // Can't draw empty line, so substitute with a space. TODO
+                    // Can't draw empty line, so substitute it with a space. TODO
                     self.write_buf.extend_from_slice(" ".as_bytes());
                 }
             } else {
@@ -528,8 +523,8 @@ impl Editor {
                     let row = &line[offset..end];
                     assert!(row.len() > 0);
 
-                    log(format!("bytes left: {}, offset: {}, row.len: {}",
-                            n_bytes_left, offset, row.len()).as_bytes());
+                    //log(format!("bytes left: {}, offset: {}, row.len: {}",
+                            //n_bytes_left, offset, row.len()).as_bytes());
 
                     self.write_buf.extend_from_slice(row);
 
