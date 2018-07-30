@@ -12,6 +12,10 @@ use std::cmp;
 
 use nix::sys::termios;
 
+pub struct Config {
+    tab_width: i32,
+}
+
 /// A data type that represents where in the console window something resides.
 /// Indexing starts at 0 (even though the VT100 escape sequences expect
 /// coordinates starting at 1), because mixing 1-based indexing with 0-based
@@ -99,10 +103,11 @@ struct Editor {
     // The first character of the row in line that should be drawn. Always
     // a multiple of `window_width`. Also zero-based.
     line_offset_byte: usize,
+    config: Config,
 }
 
 impl Editor {
-    pub fn new() -> Editor {
+    pub fn new(config: Config) -> Editor {
         Editor {
             cursor: Cursor { pos: Pos { row: 0, col: 0 }, line: 0, byte: 0, is_at_eol: false },
             window_width: 0,
@@ -111,11 +116,12 @@ impl Editor {
             lines: vec![],
             line_offset: 0,
             line_offset_byte: 0,
+            config: config,
         }
     }
 
-    pub fn open_file(path: &Path) -> Editor {
-        let mut editor = Editor::new();
+    pub fn open_file(config: Config, path: &Path) -> Editor {
+        let mut editor = Editor::new(config);
 
         // TODO error handling: somehow let user know that we could not open file
         if let Ok(mut file) = File::open(path) {
@@ -137,7 +143,10 @@ impl Editor {
             }
 
             editor.lines = lines
-                .map(|line| Line { orig: line.to_vec(), render: Editor::line_orig_to_render(&line) })
+                .map(|line| Line {
+                    orig: line.to_vec(),
+                    render: editor.line_orig_to_render(&line)
+                })
                 .collect();
 
             let dbg_lines: Vec<String> = editor.lines.iter()
@@ -188,6 +197,7 @@ impl Editor {
                         self.cursor_left();
                     }
                 },
+                // FIXME this doesn't work
                 Key::LineEnd => {
                     while self.cursor.byte + 1 < self.lines[self.cursor.line].len()
                         && self.cursor.pos.col + 1 < self.window_width {
@@ -521,12 +531,15 @@ impl Editor {
         self.flush_write_buf();
     }
 
-    fn line_orig_to_render(line: &[u8]) -> Vec<u8> {
+    fn line_orig_to_render(&self, line: &[u8]) -> Vec<u8> {
         let mut render = vec![];
-        for b in line.iter() {
+        for (pos, b) in line.iter().enumerate() {
             if *b as char == '\t' {
-                for _ in 0..4 {
+                let mut i = pos + 1;
+                render.push(' ' as u8);
+                while i % self.config.tab_width as usize != 0 {
                     render.push(' ' as u8);
+                    i += 1;
                 }
             } else {
                 render.push(*b);
@@ -745,11 +758,13 @@ fn main() {
         &raw_termios,
     ).unwrap();
 
+    let config = Config { tab_width: 4 };
+
     let args: Vec<String> = args().collect();
     if args.len() > 1 {
-        Editor::open_file(Path::new(&args[1])).run();
+        Editor::open_file(config, Path::new(&args[1])).run();
     } else {
-        Editor::new().run();
+        Editor::new(config).run();
     }
 
     // Restore the original termios config.
