@@ -15,7 +15,7 @@ use nix::sys::termios;
 /// A data type that represents where in the console window something resides.
 /// Indexing starts at 0 (even though the VT100 escape sequences expect
 /// coordinates starting at 1), because mixing 1-based indexing with 0-based
-/// indexing lead to errors. Pos { col: 0, row: 0 } corresponds to the top left
+/// indexing can lead to errors. Pos { col: 0, row: 0 } corresponds to the top left
 /// corner of the terminal.
 #[derive(Debug, Clone, Copy)]
 struct Pos {
@@ -30,13 +30,15 @@ enum Key {
     ArrowRight,
     PageUp,
     PageDown,
-    Home,
-    End,
+    LineHome,
+    LineEnd,
+    FileHome,
+    FileEnd,
     Delete,
 }
 
-fn ctrl_mask(c: u8) -> u8 {
-    c & 0x1f
+fn ctrl_mask(c: char) -> char {
+    (c as u8 & 0x1f) as char
 }
 
 #[derive(Debug)]
@@ -54,14 +56,32 @@ struct Cursor {
     /// In order to be able to go up and down along the ends of lines of
     /// different lengths (including 0), this flag needs to be set to determine
     /// whether to go to the same column in the next row or to its end.
+    // TODO don't limit to EoL: make it universal, as in with a `stay_on_col` field
     is_at_eol: bool,
+}
+
+struct Line {
+    // The original representation of the line.
+    orig: Vec<u8>,
+    // Represents how the line is rendered on screen.
+    render: Vec<u8>
+}
+
+impl Line {
+    fn len(&self) -> usize {
+        self.render.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.render.is_empty()
+    }
 }
 
 struct Editor {
     // Note that this does not always report the actual position of the cursor.
-    // Instead, it is the _desired_ position, i.e. what user sets. It may be
-    // that for rendering purposes the cursor is temporarily relocated, but then
-    // always set back to this position. This also means that when it's
+    // Instead, it reflects the _desired_ position, i.e. what user sets. It may
+    // be that for rendering purposes the cursor is temporarily relocated but
+    // then set back to this position. This also means that when it's
     // temporarily relocated, this field shall not be updated.
     cursor: Cursor,
     window_width: usize,
@@ -69,11 +89,11 @@ struct Editor {
     // Used to coalesce writes into a single buffer to then flush it in one go
     // to avoid excessive IO overhead.
     write_buf: Vec<u8>,
-    // Store each line as a separate string in a vector. Note that there is
-    // a distinction between rows and lines. A line is the string of text until
-    // the new-line character, as stored in the file, while a row is the
-    // rendered string. This means a line may wrap several rows.
-    lines: Vec<Vec<u8>>,
+    // Note that there is a distinction between rows and lines. A line is the
+    // string of text until the new-line character, as stored in the file, while
+    // a row is the rendered string that fits into a single row in the window.
+    // Thus a line may wrap several rows.
+    lines: Vec<Line>,
     // The zero-based index into `lines` of the first line to show.
     line_offset: usize,
     // The first character of the row in line that should be drawn. Always
@@ -117,11 +137,11 @@ impl Editor {
             }
 
             editor.lines = lines
-                .map(|line| line.to_vec())
+                .map(|line| Line { orig: line.to_vec(), render: Editor::line_orig_to_render(&line) })
                 .collect();
 
             let dbg_lines: Vec<String> = editor.lines.iter()
-                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                .map(|line| String::from_utf8_lossy(&line.orig).to_string())
                 .collect();
             log(format!("file ({} lines):\n{:?}", editor.lines.len(), dbg_lines).as_bytes());
         }
@@ -133,9 +153,10 @@ impl Editor {
         let mut buf: [u8; 1] = [0; 1];
         loop {
             self.refresh_screen();
+            // TODO is there a canonical way of getting a single byte from stdin?
             if let Ok(_) = io::stdin().read_exact(&mut buf) {
                 let b = buf[0];
-                if b == ctrl_mask('c' as u8) {
+                if b as char == ctrl_mask('c') {
                     break;
                 } else {
                     self.handle_key(b as char)
@@ -162,17 +183,20 @@ impl Editor {
                 Key::ArrowRight => self.cursor_right(),
                 Key::PageUp => self.page_up(),
                 Key::PageDown => self.page_down(),
-                Key::Home => {
-                    // TODO adjust this to line wrapping
-                    self.cursor.pos = Pos { row: 0, col: 0 };
-                    self.cursor.line = 0;
-                    self.cursor.byte = 0;
-                    self.line_offset = 0;
+                Key::LineHome => {
+                    while self.cursor.byte > 0 {
+                        self.cursor_left();
+                    }
+                },
+                Key::LineEnd => {
+                    while self.cursor.byte + 1 < self.lines[self.cursor.line].len()
+                        && self.cursor.pos.col + 1 < self.window_width {
+                        self.cursor_right();
+                    }
+                },
+                Key::FileHome => {
                 }
-                Key::End => {
-                    // TODO adjust this to line wrapping
-                    self.cursor.pos = Pos {  col: 0, row: self.window_height - 1 };
-                    self.line_offset = self.lines.len() - self.window_height;
+                Key::FileEnd => {
                 }
                 _ => (),
             }
@@ -280,9 +304,6 @@ impl Editor {
                             self.line_offset, self.line_offset_byte, self.cursor.line).as_bytes());
                 self.cursor.pos.row -= 1;
             }
-            // Since this shifts the whole window by one and cursor's position is relative to the
-            // window's top, we need to subtract one from cursor's row position to keep it in the
-            // same place it had been prior to this call.
         }
     }
 
@@ -400,6 +421,9 @@ impl Editor {
 
     /// Returns the position of the last byte in the row under the cursor.
     fn curr_last_pos_row_offset(&self) -> usize {
+        if self.lines.is_empty() {
+            return 0;
+        }
         let line = &self.lines[self.cursor.line];
         if line.is_empty() {
             0
@@ -409,7 +433,7 @@ impl Editor {
         }
     }
 
-    /// Similary to curr_last_pos_row_offset, but returns the that position's aboslute
+    /// Similary to curr_last_pos_row_offset, but returns the that position's absolute
     /// offset from the line's start.
     fn curr_last_pos_line_offset(&self) -> usize {
         self.cursor.byte + self.curr_last_pos_row_offset() - self.cursor.pos.col
@@ -429,45 +453,54 @@ impl Editor {
     /// was deteced.
     fn read_esc_seq_to_key(&mut self) -> Option<Key> {
         let mut buf: [u8; 3] = [0; 3];
-        if let Ok(_) = io::stdin().read_exact(&mut buf[..2]) {
-            if buf[0] as char == '[' {
-                if buf[1] as char >= '0' && buf[1] as char <= '9' {
-                    if let Err(_) = io::stdin().read_exact(&mut buf[2..3]) {
-                        return None;
-                    }
-                    if buf[2] as char == '~' {
-                        return match buf[1] as char {
-                            '1' | '7' => Some(Key::Home),
-                            '4' | '8' => Some(Key::End),
-                            '3' => Some(Key::Delete),
-                            '5' => Some(Key::PageUp),
-                            '6' => Some(Key::PageDown),
-                            _ => None,
-                        };
-                    }
-                } else {
-                    return match buf[1] as char {
-                        'A' => Some(Key::ArrowUp),
-                        'B' => Some(Key::ArrowDown),
-                        'C' => Some(Key::ArrowRight),
-                        'D' => Some(Key::ArrowLeft),
-                        'H' => Some(Key::Home),
-                        'F' => Some(Key::End),
-                        _ => None,
-                    };
-                }
-            } else if buf[0] as char == 'O' {
-                return match buf[1] as char {
-                    'H' => Some(Key::Home),
-                    'F' => Some(Key::End),
-                    _ => None,
-                };
-            }
+        if let Err(_) = io::stdin().read_exact(&mut buf[..2]) {
+            return None;
         }
-        None
+
+        let c = buf[0] as char;
+        if c == '[' {
+            let c = buf[1] as char;
+            if c >= '0' && c <= '9' {
+                if let Err(_) = io::stdin().read_exact(&mut buf[2..3]) {
+                    return None;
+                }
+
+                let c = buf[2] as char;
+                return if c == '~' {
+                    let c = buf[1] as char;
+                    match c {
+                        '1' | '7' => Some(Key::LineHome),
+                        '4' | '8' => Some(Key::LineEnd),
+                        '3' => Some(Key::Delete),
+                        '5' => Some(Key::PageUp),
+                        '6' => Some(Key::PageDown),
+                        _ =>  None
+                    }
+                } else { None };
+            } else {
+                let c = buf[1] as char;
+                match c {
+                    'A' => Some(Key::ArrowUp),
+                    'B' => Some(Key::ArrowDown),
+                    'C' => Some(Key::ArrowRight),
+                    'D' => Some(Key::ArrowLeft),
+                    'H' => Some(Key::LineHome),
+                    _ => None
+                }
+            }
+        } else if c == 'O' {
+            let c = buf[1] as char;
+            match c {
+                'H' => Some(Key::LineHome),
+                'F' => Some(Key::LineEnd),
+                _ => None
+            }
+        } else {
+            None
+        }
     }
 
-    fn handle_input(&mut self, c: char) {
+    fn handle_input(&mut self, _c: char) {
     }
 
     fn refresh_screen(&mut self) {
@@ -488,9 +521,22 @@ impl Editor {
         self.flush_write_buf();
     }
 
+    fn line_orig_to_render(line: &[u8]) -> Vec<u8> {
+        let mut render = vec![];
+        for b in line.iter() {
+            if *b as char == '\t' {
+                for _ in 0..4 {
+                    render.push(' ' as u8);
+                }
+            } else {
+                render.push(*b);
+            }
+        }
+        render
+    }
+
     fn build_rows(&mut self) {
         let mut n_rows_drawn = 0;
-
         for line in self.lines.iter().skip(self.line_offset) {
             if n_rows_drawn == self.window_height {
                 break;
@@ -509,31 +555,29 @@ impl Editor {
                 }
             };
 
+            // It's an empty line.
             if n_bytes_left == 0 {
                 // Clear row.
                 self.write_buf.extend_from_slice("\x1b[K".as_bytes());
                 n_rows_drawn += 1;
-                // An empty line is just a line break.
                 if n_rows_drawn < self.window_height {
                     self.write_buf.extend_from_slice("\r\n".as_bytes());
                 } else {
-                    // Can't draw empty line, so substitute it with a space. TODO
                     self.write_buf.extend_from_slice(" ".as_bytes());
                 }
             } else {
                 // Split up line into rows.
                 while n_bytes_left > 0 && n_rows_drawn < self.window_height {
-                    // Clear row.
-                    // TODO we should use self.clear_row function but can't due to ownership
-                    self.write_buf.extend_from_slice("\x1b[K".as_bytes());
-
                     let end = offset + cmp::min(self.window_width, n_bytes_left);
-                    let row = &line[offset..end];
-                    assert!(row.len() > 0);
+                    let row = &line.render[offset..end];
 
+                    assert!(row.len() > 0);
                     //log(format!("bytes left: {}, offset: {}, row.len: {}",
                             //n_bytes_left, offset, row.len()).as_bytes());
 
+                    // Clear row.
+                    // TODO we should use self.clear_row function but can't due to ownership
+                    self.write_buf.extend_from_slice("\x1b[K".as_bytes());
                     self.write_buf.extend_from_slice(row);
 
                     offset += row.len();
@@ -689,7 +733,7 @@ fn log(buf: &[u8]) {
 
 fn main() {
     init_log();
-    // Save the terminal config as it was before entering raw mode with the
+    // Save the current terminal config before entering raw mode with the
     // instantiation of the editor so that we can restore it on drop.
     let orig_termios = termios::tcgetattr(io::stdin().as_raw_fd()).unwrap();
     let mut raw_termios = orig_termios.clone();
