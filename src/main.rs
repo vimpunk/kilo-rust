@@ -104,10 +104,13 @@ struct Editor {
     // a multiple of `window_width`. Also zero-based.
     line_offset_byte: usize,
     config: Config,
+    // The path of the file currently being edited. Stored as a string since
+    // we're only printing it on the status bar.
+    path: String,
 }
 
 impl Editor {
-    pub fn new(config: Config) -> Editor {
+    fn new(config: Config, path: String) -> Editor {
         Editor {
             cursor: Cursor { pos: Pos { row: 0, col: 0 }, line: 0, byte: 0, is_at_eol: false },
             window_width: 0,
@@ -117,45 +120,45 @@ impl Editor {
             line_offset: 0,
             line_offset_byte: 0,
             config: config,
+            path: path,
         }
     }
 
-    pub fn open_file(config: Config, path: &Path) -> Editor {
-        let mut editor = Editor::new(config);
+    pub fn open_file(config: Config, path: &Path) -> std::io::Result<Editor> {
+        let mut file = File::open(path)?;
+        let path = path.file_name().unwrap().to_str().unwrap().to_string();
+        let mut editor = Editor::new(config, path);
+        let mut buf = vec![];
 
-        // TODO error handling: somehow let user know that we could not open file
-        if let Ok(mut file) = File::open(path) {
-            let mut buf = vec![];
-            file.read_to_end(&mut buf).unwrap();
+        file.read_to_end(&mut buf).unwrap();
 
-            // TODO might need to match \r\n as well
-            // FIXME there's an extra empty space at the end even if there shouldn't be
-            let lines = buf.split(|b| *b == '\n' as u8);
+        // TODO might need to match \r\n as well
+        // FIXME there's an extra empty space at the end even if there shouldn't be
+        let lines = buf.split(|b| *b == '\n' as u8);
 
-            // Try to get an esimate of the number of lines in file.
-            let size_hint = {
-                let (lower, upper) = lines.size_hint();
-                if let Some(upper) = upper { upper } else { lower }
-            };
+        // Try to get an esimate of the number of lines in file.
+        let size_hint = {
+            let (lower, upper) = lines.size_hint();
+            if let Some(upper) = upper { upper } else { lower }
+        };
 
-            if size_hint > 0 {
-                editor.lines.reserve(size_hint);
-            }
-
-            editor.lines = lines
-                .map(|line| Line {
-                    orig: line.to_vec(),
-                    render: editor.line_orig_to_render(&line)
-                })
-                .collect();
-
-            let dbg_lines: Vec<String> = editor.lines.iter()
-                .map(|line| String::from_utf8_lossy(&line.orig).to_string())
-                .collect();
-            log(format!("file ({} lines):\n{:?}", editor.lines.len(), dbg_lines).as_bytes());
+        if size_hint > 0 {
+            editor.lines.reserve(size_hint);
         }
 
-        editor
+        editor.lines = lines
+            .map(|line| Line {
+                orig: line.to_vec(),
+                render: editor.line_orig_to_render(&line)
+            })
+            .collect();
+
+        let dbg_lines: Vec<String> = editor.lines.iter()
+            .map(|line| String::from_utf8_lossy(&line.orig).to_string())
+            .collect();
+        log(format!("file ({} lines):\n{:?}", editor.lines.len(), dbg_lines).as_bytes());
+
+        Ok(editor)
     }
 
     pub fn run(&mut self) {
@@ -522,6 +525,7 @@ impl Editor {
         self.move_cursor(Pos { row: 0, col: 0 });
         // Append text to write buffer while clearing old data.
         self.build_rows();
+        self.build_status_bar();
         // (Rust giving me crap for directly passing self.cursor.pos.)
         let cursor = self.cursor.pos;
         // Move cursor back to its original position.
@@ -589,18 +593,14 @@ impl Editor {
                             //n_bytes_left, offset, row.len()).as_bytes());
 
                     // Clear row.
-                    // TODO we should use self.clear_row function but can't due to ownership
+                    // TODO we should use self.clear_row but can't due to ownership
                     self.write_buf.extend_from_slice("\x1b[K".as_bytes());
                     self.write_buf.extend_from_slice(row);
+                    self.write_buf.extend_from_slice("\r\n".as_bytes());
 
                     offset += row.len();
                     n_bytes_left -= row.len();
                     n_rows_drawn += 1;
-
-                    // Don't put a new line on the last row.
-                    if n_rows_drawn < self.window_height {
-                        self.write_buf.extend_from_slice("\r\n".as_bytes());
-                    }
                 }
             }
         }
@@ -611,16 +611,78 @@ impl Editor {
         // fill the rest with '~'s.
         let n_empty_rows = self.window_height - n_rows_drawn;
         if n_empty_rows > 0 {
-            for _ in 1..(n_empty_rows - 1) {
+            for _ in 1..(n_empty_rows) {
                 self.write_buf.extend_from_slice("~\r\n".as_bytes());
                 self.clear_row();
             }
-
-            // Don't put a new line on our last row as that will make the terminal
-            // scroll down.
-            self.write_buf.extend_from_slice("~".as_bytes());
-            self.clear_row();
         }
+    }
+
+    fn build_status_bar(&mut self) {
+        // Invert colors.
+        self.defer_esc_seq("1m");
+        // Make text bold.
+        self.defer_esc_seq("7m");
+
+        let mut buf = Vec::with_capacity(self.window_width);
+        let sep = " | ";
+
+        let line_count = {
+            let mut buf = self.lines.len().to_string();
+            if self.lines.len() == 1 {
+                buf += " line";
+            } else {
+                buf += " lines";
+            }
+            buf
+        };
+
+        let cursor_pos = {
+            let mut buf;
+            buf = self.cursor.line.to_string();
+            buf += ":";
+            buf += &self.cursor.pos.col.to_string()[..];
+            buf
+        };
+
+        let (n_used_bytes, n_path_bytes) = {
+            // NOTE: count separators as well: 1 between path and cursor
+            // position, and 1 between the latter and line count.
+            let mut n_used_bytes = cursor_pos.len() + line_count.len() + sep.len() * 1;
+            let n_path_bytes = cmp::min(self.window_width - n_used_bytes, self.path.len());
+            n_used_bytes += n_path_bytes;
+            (n_used_bytes, n_path_bytes)
+        };
+
+        // Filename goes to the left.
+        for b in self.path.as_bytes().iter().take(n_path_bytes) {
+            buf.push(*b);
+        }
+
+        // Fill up empty space.
+        for _ in 0..self.window_width - n_used_bytes {
+            buf.push(' ' as u8);
+        }
+
+        // Cursor position.
+        for b in cursor_pos.as_bytes().iter() {
+            buf.push(*b);
+        }
+
+        // Separator.
+        for b in sep.as_bytes().iter() {
+            buf.push(*b);
+        }
+
+        // Line count.
+        for b in line_count.as_bytes().iter() {
+            buf.push(*b);
+        }
+
+        log(format!("status bar buffer: {:?}", buf).as_bytes());
+        self.write_buf.append(&mut buf);
+        // Revert invert colors.
+        self.defer_esc_seq("m");
     }
 
     fn flush_write_buf(&mut self) {
@@ -670,7 +732,9 @@ impl Editor {
         self.send_esc_seq("999B");
         let bottom_right_corner = self.cursor_pos();
         self.window_width = bottom_right_corner.col + 1;
-        self.window_height = bottom_right_corner.row + 1;
+        // NOTE: we don't add + 1 to it since we want to keep space for the
+        // statusline.
+        self.window_height = bottom_right_corner.row;
     }
 
     fn cursor_pos(&mut self) -> Pos {
@@ -762,9 +826,9 @@ fn main() {
 
     let args: Vec<String> = args().collect();
     if args.len() > 1 {
-        Editor::open_file(config, Path::new(&args[1])).run();
+        Editor::open_file(config, Path::new(&args[1])).unwrap().run();
     } else {
-        Editor::new(config).run();
+        // TODO report error or ask for a file name
     }
 
     // Restore the original termios config.
