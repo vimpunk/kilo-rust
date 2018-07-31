@@ -163,6 +163,8 @@ impl Editor {
 
     pub fn run(&mut self) {
         let mut buf: [u8; 1] = [0; 1];
+        self.refresh_screen();
+        self.status_message("HELP: Ctrl-C to quit", 5);
         loop {
             self.refresh_screen();
             // TODO is there a canonical way of getting a single byte from stdin?
@@ -575,12 +577,12 @@ impl Editor {
             // It's an empty line.
             if n_bytes_left == 0 {
                 // Clear row.
-                self.write_buf.extend_from_slice("\x1b[K".as_bytes());
+                self.write_buf.extend("\x1b[K".as_bytes());
                 n_rows_drawn += 1;
                 if n_rows_drawn < self.window_height {
-                    self.write_buf.extend_from_slice("\r\n".as_bytes());
+                    self.write_buf.extend("\r\n".as_bytes());
                 } else {
-                    self.write_buf.extend_from_slice(" ".as_bytes());
+                    self.write_buf.extend(" ".as_bytes());
                 }
             } else {
                 // Split up line into rows.
@@ -594,9 +596,9 @@ impl Editor {
 
                     // Clear row.
                     // TODO we should use self.clear_row but can't due to ownership
-                    self.write_buf.extend_from_slice("\x1b[K".as_bytes());
-                    self.write_buf.extend_from_slice(row);
-                    self.write_buf.extend_from_slice("\r\n".as_bytes());
+                    self.write_buf.extend("\x1b[K".as_bytes());
+                    self.write_buf.extend(row);
+                    self.write_buf.extend("\r\n".as_bytes());
 
                     offset += row.len();
                     n_bytes_left -= row.len();
@@ -612,21 +614,22 @@ impl Editor {
         let n_empty_rows = self.window_height - n_rows_drawn;
         if n_empty_rows > 0 {
             for _ in 1..(n_empty_rows) {
-                self.write_buf.extend_from_slice("~\r\n".as_bytes());
+                self.write_buf.extend("~\r\n".as_bytes());
                 self.clear_row();
             }
         }
     }
 
     fn build_status_bar(&mut self) {
+        // TODO also count escape sequences
+        self.write_buf.reserve(self.window_width);
+
         // Invert colors.
         self.defer_esc_seq("1m");
         // Make text bold.
         self.defer_esc_seq("7m");
 
-        let mut buf = Vec::with_capacity(self.window_width);
         let sep = " | ";
-
         let line_count = {
             let mut buf = self.lines.len().to_string();
             if self.lines.len() == 1 {
@@ -636,53 +639,39 @@ impl Editor {
             }
             buf
         };
-
         let cursor_pos = {
-            let mut buf;
-            buf = self.cursor.line.to_string();
+            let mut buf = self.cursor.line.to_string();
             buf += ":";
             buf += &self.cursor.pos.col.to_string()[..];
             buf
         };
-
         let (n_used_bytes, n_path_bytes) = {
-            // NOTE: count separators as well: 1 between path and cursor
-            // position, and 1 between the latter and line count.
+            // NOTE: count separators as well: one separator between path and
+            // cursor position, and one between the latter and line count.
             let mut n_used_bytes = cursor_pos.len() + line_count.len() + sep.len() * 1;
             let n_path_bytes = cmp::min(self.window_width - n_used_bytes, self.path.len());
             n_used_bytes += n_path_bytes;
             (n_used_bytes, n_path_bytes)
         };
 
-        // Filename goes to the left.
-        for b in self.path.as_bytes().iter().take(n_path_bytes) {
-            buf.push(*b);
-        }
-
+        self.write_buf.extend(self.path.as_bytes().iter().take(n_path_bytes));
         // Fill up empty space.
+        //self.write_buf.extend(std::iter::repeat(' ' as u8).take(self.window_width - n_used_bytes));
         for _ in 0..self.window_width - n_used_bytes {
-            buf.push(' ' as u8);
+            self.write_buf.push(' ' as u8);
         }
+        self.write_buf.extend(cursor_pos.as_bytes().iter());
+        self.write_buf.extend(sep.as_bytes().iter());
+        self.write_buf.extend(line_count.as_bytes().iter());
 
-        // Cursor position.
-        for b in cursor_pos.as_bytes().iter() {
-            buf.push(*b);
-        }
-
-        // Separator.
-        for b in sep.as_bytes().iter() {
-            buf.push(*b);
-        }
-
-        // Line count.
-        for b in line_count.as_bytes().iter() {
-            buf.push(*b);
-        }
-
-        log(format!("status bar buffer: {:?}", buf).as_bytes());
-        self.write_buf.append(&mut buf);
+        log(format!("status bar buffer: {:?}", &self.write_buf[self.write_buf.len() - self.window_width..]).as_bytes());
         // Revert invert colors.
         self.defer_esc_seq("m");
+    }
+
+    fn status_message(&mut self, msg: &str, _timeout: i32) {
+        let len = cmp::min(self.window_width, msg.len());
+        self.write_buf.extend(msg.as_bytes().iter().take(len));
     }
 
     fn flush_write_buf(&mut self) {
@@ -715,7 +704,7 @@ impl Editor {
     /// Appends the specified escape sequence to the write buffer which needs to
     /// be manually flushed for the sequence to take effect.
     fn defer_esc_seq(&mut self, cmd: &str) {
-        self.write_buf.extend_from_slice(&format!("\x1b[{}", cmd).as_bytes());
+        self.write_buf.extend(format!("\x1b[{}", cmd).as_bytes());
     }
 
     /// Immeadiately sends the specified escape sequence to the terminal.
@@ -732,9 +721,10 @@ impl Editor {
         self.send_esc_seq("999B");
         let bottom_right_corner = self.cursor_pos();
         self.window_width = bottom_right_corner.col + 1;
-        // NOTE: we don't add + 1 to it since we want to keep space for the
-        // statusline.
-        self.window_height = bottom_right_corner.row;
+        // NOTE: subtract 2 from the result: 1 for the status bar and 1 for the
+        // status message bar (only subtract one since the + 1 hasn't been added
+        // to begin with).
+        self.window_height = bottom_right_corner.row - 1;
     }
 
     fn cursor_pos(&mut self) -> Pos {
