@@ -9,6 +9,7 @@ use std::os::unix::io::AsRawFd;
 use std::env::args;
 use std::path::Path;
 use std::cmp;
+use std::time::{Duration, Instant};
 
 use nix::sys::termios;
 
@@ -81,6 +82,14 @@ impl Line {
     }
 }
 
+struct StatusMsg {
+    data: String,
+    // The time the status message was issued. All status messages remain on the
+    // screen for at least `timeout` seconds.
+    timestamp: Instant,
+    timeout: Duration,
+}
+
 struct Editor {
     // Note that this does not always report the actual position of the cursor.
     // Instead, it reflects the _desired_ position, i.e. what user sets. It may
@@ -107,6 +116,8 @@ struct Editor {
     // The path of the file currently being edited. Stored as a string since
     // we're only printing it on the status bar.
     path: String,
+    // Store the status message so that it's persisted across screen redraws.
+    status_msg: StatusMsg,
 }
 
 impl Editor {
@@ -121,6 +132,11 @@ impl Editor {
             line_offset_byte: 0,
             config: config,
             path: path,
+            status_msg: StatusMsg {
+                data: String::new(),
+                timestamp: Instant::now(),
+                timeout: Duration::new(0, 0),
+            },
         }
     }
 
@@ -164,7 +180,7 @@ impl Editor {
     pub fn run(&mut self) {
         let mut buf: [u8; 1] = [0; 1];
         self.refresh_screen();
-        self.status_message("HELP: Ctrl-C to quit", 5);
+        self.new_status_msg("HELP: Ctrl-C to quit", Duration::from_secs(5));
         loop {
             self.refresh_screen();
             // TODO is there a canonical way of getting a single byte from stdin?
@@ -528,6 +544,7 @@ impl Editor {
         // Append text to write buffer while clearing old data.
         self.build_rows();
         self.build_status_bar();
+        self.update_status_msg();
         // (Rust giving me crap for directly passing self.cursor.pos.)
         let cursor = self.cursor.pos;
         // Move cursor back to its original position.
@@ -669,9 +686,29 @@ impl Editor {
         self.defer_esc_seq("m");
     }
 
-    fn status_message(&mut self, msg: &str, _timeout: i32) {
-        let len = cmp::min(self.window_width, msg.len());
-        self.write_buf.extend(msg.as_bytes().iter().take(len));
+    fn new_status_msg(&mut self, msg: &str, timeout: Duration) {
+        //let len = cmp::min(self.window_width, msg.len());
+        //self.write_buf.extend(msg.as_bytes().iter().take(len));
+        self.status_msg = StatusMsg {
+            data: msg.to_string(),
+            timestamp: Instant::now(),
+            timeout: timeout,
+        };
+        self.write_status_msg();
+    }
+
+    fn update_status_msg(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.status_msg.timestamp) <= self.status_msg.timeout {
+            self.write_status_msg();
+        } else {
+            self.status_msg.data.clear();
+        }
+    }
+
+    fn write_status_msg(&mut self) {
+        let len = cmp::min(self.window_width, self.status_msg.data.len());
+        self.write_buf.extend(self.status_msg.data.as_bytes().iter().take(len));
     }
 
     fn flush_write_buf(&mut self) {
